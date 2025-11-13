@@ -140,7 +140,7 @@ const sidebars: SidebarsConfig = {
     },
     {
       type: "category",
-      label: "Triggers",
+      label: "Triggers & Actions",
       customProps: {
         badge: {
           label: "New",
@@ -153,8 +153,10 @@ const sidebars: SidebarsConfig = {
         {
           type: "category",
           label: "Providers",
-          items: ["triggers/airtable"],
+          items: ["triggers/airtable", "triggers/github"],
         },
+        "actions/overview",
+        "actions/airtable",
       ],
     },
     {

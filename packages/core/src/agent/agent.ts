@@ -81,6 +81,7 @@ export type { AgentHooks } from "./hooks";
 import { P, match } from "ts-pattern";
 import type { StopWhen } from "../ai-types";
 import type { SamplingPolicy } from "../eval/runtime";
+import type { ConversationStepRecord } from "../memory/types";
 import { ConversationBuffer } from "./conversation-buffer";
 import {
   type NormalizedInputGuardrail,
@@ -90,7 +91,11 @@ import {
   normalizeInputGuardrailList,
   normalizeOutputGuardrailList,
 } from "./guardrail";
-import { MemoryPersistQueue } from "./memory-persist-queue";
+import {
+  AGENT_METADATA_CONTEXT_KEY,
+  type AgentMetadataContextValue,
+  MemoryPersistQueue,
+} from "./memory-persist-queue";
 import { sanitizeMessagesForModel } from "./message-normalizer";
 import {
   type GuardrailPipeline,
@@ -117,6 +122,7 @@ import type {
 
 const BUFFER_CONTEXT_KEY = Symbol("conversationBuffer");
 const QUEUE_CONTEXT_KEY = Symbol("memoryPersistQueue");
+const STEP_PERSIST_COUNT_KEY = Symbol("persistedStepCount");
 
 // ============================================================================
 // Types
@@ -216,7 +222,12 @@ function cloneGenerateTextResultWithContext<
   OUTPUT = any,
 >(
   result: GenerateTextResult<TOOLS, OUTPUT>,
-  overrides: Pick<GenerateTextResultWithContext<TOOLS, OUTPUT>, "text" | "context">,
+  overrides: Partial<
+    Pick<
+      GenerateTextResultWithContext<TOOLS, OUTPUT>,
+      "text" | "context" | "toolCalls" | "toolResults"
+    >
+  >,
 ): GenerateTextResultWithContext<TOOLS, OUTPUT> {
   const prototype = Object.getPrototypeOf(result);
   const clone = Object.create(prototype) as GenerateTextResultWithContext<TOOLS, OUTPUT>;
@@ -298,6 +309,11 @@ export interface BaseGenerationOptions extends Partial<CallSettings> {
   // maxOutputTokens, temperature, topP, topK,
   // presencePenalty, frequencyPenalty, stopSequences,
   // seed, maxRetries, abortSignal, headers
+  /**
+   * Optional explicit stop sequences to pass through to the underlying provider.
+   * Mirrors the `stop` option supported by ai-sdk `generateText/streamText`.
+   */
+  stop?: string | string[];
 }
 
 export type GenerateTextOptions = BaseGenerationOptions;
@@ -547,7 +563,7 @@ export class Agent {
         });
         const finalizeLLMSpan = this.createLLMSpanFinalizer(llmSpan);
 
-        let result: GenerateTextResult<any>;
+        let result!: GenerateTextResult<ToolSet, unknown>;
         try {
           result = await oc.traceContext.withSpan(llmSpan, () =>
             generateText({
@@ -582,6 +598,11 @@ export class Agent {
           usage: resolvedProviderUsage,
           finishReason: result.finishReason,
         });
+
+        const { toolCalls: aggregatedToolCalls, toolResults: aggregatedToolResults } =
+          this.collectToolDataFromResult(result);
+
+        this.recordStepResults(result.steps, oc);
 
         await persistQueue.flush(buffer, oc);
 
@@ -628,7 +649,7 @@ export class Agent {
             duration: Date.now() - startTime,
             finishReason: result.finishReason,
             usage: result.usage,
-            toolCalls: result.toolCalls?.length || 0,
+            toolCalls: aggregatedToolCalls.length,
             text: finalText,
           },
         );
@@ -653,7 +674,7 @@ export class Agent {
           metadata: {
             finishReason: result.finishReason,
             usage: result.usage ? JSON.parse(safeStringify(result.usage)) : undefined,
-            toolCalls: result.toolCalls,
+            toolCalls: aggregatedToolCalls,
           },
         });
 
@@ -663,6 +684,8 @@ export class Agent {
         return cloneGenerateTextResultWithContext(result, {
           text: finalText,
           context: oc.context,
+          toolCalls: aggregatedToolCalls,
+          toolResults: aggregatedToolResults,
         });
       } catch (error) {
         // Check if this is a BailError (subagent early termination via abort)
@@ -714,6 +737,8 @@ export class Agent {
               error: undefined,
               context: oc,
             });
+
+            this.recordStepResults(undefined, oc);
 
             // Return bailed result as successful generation
             return {
@@ -1000,6 +1025,8 @@ export class Agent {
 
             oc.traceContext.setOutput(finalText);
 
+            this.recordStepResults(finalResult.steps, oc);
+
             // Set finish reason - override to "stop" if bailed (not "error")
             if (bailedResult) {
               oc.traceContext.setFinishReason("stop" as any);
@@ -1064,6 +1091,11 @@ export class Agent {
                   : undefined,
                 toolCalls: finalResult.toolCalls,
               },
+            });
+
+            finalizeLLMSpan(SpanStatusCode.OK, {
+              usage: finalResult.totalUsage,
+              finishReason: finalResult.finishReason,
             });
 
             oc.traceContext.end("completed");
@@ -1969,6 +2001,23 @@ export class Agent {
     };
   }
 
+  private collectToolDataFromResult<TOOLS extends ToolSet, OUTPUT>(
+    result: GenerateTextResult<TOOLS, OUTPUT>,
+  ): {
+    toolCalls: GenerateTextResult<TOOLS, OUTPUT>["toolCalls"];
+    toolResults: GenerateTextResult<TOOLS, OUTPUT>["toolResults"];
+  } {
+    const steps = result.steps ?? [];
+
+    const stepToolCalls = steps.flatMap((step) => step.toolCalls ?? []);
+    const stepToolResults = steps.flatMap((step) => step.toolResults ?? []);
+
+    return {
+      toolCalls: stepToolCalls.length > 0 ? stepToolCalls : (result.toolCalls ?? []),
+      toolResults: stepToolResults.length > 0 ? stepToolResults : (result.toolResults ?? []),
+    };
+  }
+
   /**
    * Create execution context
    */
@@ -2039,6 +2088,7 @@ export class Agent {
       parentAgentId: options?.parentAgentId,
       input,
     });
+    traceContext.getRootSpan().setAttribute("voltagent.operation_id", operationId);
 
     // Use parent's AbortController if available, otherwise create new one
     const abortController =
@@ -2060,6 +2110,10 @@ export class Agent {
       QUEUE_CONTEXT_KEY,
       new MemoryPersistQueue(this.memoryManager, { debounceMs: 200, logger }),
     );
+    systemContext.set(AGENT_METADATA_CONTEXT_KEY, {
+      agentId: this.id,
+      agentName: this.name,
+    });
 
     const elicitationHandler = options?.elicitation ?? options?.parentOperationContext?.elicitation;
 
@@ -2197,7 +2251,9 @@ export class Agent {
         finishReason?: FinishReason | string | null;
       },
     ) => {
-      if (ended) return;
+      if (ended) {
+        return;
+      }
       if (details?.usage) {
         this.recordLLMUsage(span, details.usage);
       }
@@ -2232,22 +2288,26 @@ export class Agent {
     if (provider) {
       attrs["llm.provider"] = provider;
     }
+
     const callOptions = params.callOptions ?? {};
     const maybeNumber = (value: unknown): number | undefined => {
-      if (typeof value === "number") return value;
+      if (typeof value === "number") {
+        return Number.isFinite(value) ? value : undefined;
+      }
       if (typeof value === "string") {
         const parsed = Number(value);
         return Number.isFinite(parsed) ? parsed : undefined;
       }
       return undefined;
     };
+
     const temperature = maybeNumber(callOptions.temperature ?? callOptions.temp ?? undefined);
     if (temperature !== undefined) {
       attrs["llm.temperature"] = temperature;
     }
-    const maxOutput = maybeNumber(callOptions.maxOutputTokens);
-    if (maxOutput !== undefined) {
-      attrs["llm.max_output_tokens"] = maxOutput;
+    const maxOutputTokens = maybeNumber(callOptions.maxOutputTokens);
+    if (maxOutputTokens !== undefined) {
+      attrs["llm.max_output_tokens"] = maxOutputTokens;
     }
     const topP = maybeNumber(callOptions.topP);
     if (topP !== undefined) {
@@ -2280,9 +2340,14 @@ export class Agent {
   }
 
   private recordLLMUsage(span: Span, usage?: LanguageModelUsage | UsageInfo | null): void {
-    if (!usage) return;
+    if (!usage) {
+      return;
+    }
+
     const coerce = (value: unknown): number | undefined => {
-      if (typeof value === "number" && Number.isFinite(value)) return value;
+      if (typeof value === "number" && Number.isFinite(value)) {
+        return value;
+      }
       if (typeof value === "string") {
         const parsed = Number(value);
         return Number.isFinite(parsed) ? parsed : undefined;
@@ -3121,11 +3186,15 @@ export class Agent {
       };
 
       // Event tracking now handled by OpenTelemetry spans
+      const toolTags = (tool as { tags?: string[] | undefined }).tags;
       const toolSpan = oc.traceContext.createChildSpan(`tool.execution:${tool.name}`, "tool", {
         label: tool.name,
         attributes: {
           "tool.name": tool.name,
           "tool.call.id": toolCallId,
+          "tool.description": tool.description,
+          ...(toolTags && toolTags.length > 0 ? { "tool.tags": safeStringify(toolTags) } : {}),
+          "tool.parameters": safeStringify(tool.parameters),
           input: args ? safeStringify(args) : undefined,
         },
         kind: SpanKind.CLIENT,
@@ -3310,6 +3379,172 @@ export class Agent {
       const hooks = this.getMergedHooks(options);
       await hooks.onStepFinish?.({ agent: this, step: event, context: oc });
     };
+  }
+
+  private recordStepResults(
+    steps: ReadonlyArray<StepResult<ToolSet>> | undefined,
+    oc: OperationContext,
+  ): void {
+    const storedSteps =
+      (steps && steps.length > 0 ? steps : undefined) ||
+      (oc.systemContext.get("conversationSteps") as StepResult<ToolSet>[] | undefined);
+
+    if (!storedSteps?.length) {
+      return;
+    }
+
+    if (!oc.conversationSteps) {
+      oc.conversationSteps = [];
+    }
+
+    const previouslyPersistedCount =
+      (oc.systemContext.get(STEP_PERSIST_COUNT_KEY) as number | undefined) ?? 0;
+    const newSteps = storedSteps.slice(previouslyPersistedCount);
+
+    if (!newSteps.length) {
+      return;
+    }
+
+    oc.systemContext.set(STEP_PERSIST_COUNT_KEY, previouslyPersistedCount + newSteps.length);
+
+    if (oc.conversationId) {
+      const rootSpan = oc.traceContext.getRootSpan();
+      rootSpan.setAttribute("conversation.id", oc.conversationId);
+      rootSpan.setAttribute("voltagent.conversation_id", oc.conversationId);
+    }
+
+    const agentMetadata = oc.systemContext.get(AGENT_METADATA_CONTEXT_KEY) as
+      | AgentMetadataContextValue
+      | undefined;
+    const subAgentMetadata =
+      oc.parentAgentId && agentMetadata
+        ? {
+            subAgentId: agentMetadata.agentId,
+            subAgentName: agentMetadata.agentName,
+          }
+        : undefined;
+
+    const stepRecords: ConversationStepRecord[] = [];
+    let recordTimestamp = new Date().toISOString();
+
+    newSteps.forEach((step, offset) => {
+      const usage = convertUsage(step.usage);
+      const stepIndex = previouslyPersistedCount + offset;
+
+      const trimmedText = step.text?.trim();
+      if (trimmedText) {
+        oc.conversationSteps?.push({
+          id: randomUUID(),
+          type: "text",
+          content: trimmedText,
+          role: "assistant",
+          usage,
+          ...(subAgentMetadata ?? {}),
+        });
+
+        if (oc.userId && oc.conversationId) {
+          stepRecords.push({
+            id: randomUUID(),
+            conversationId: oc.conversationId,
+            userId: oc.userId,
+            agentId: this.id,
+            agentName: this.name,
+            operationId: oc.operationId,
+            stepIndex,
+            type: "text",
+            role: "assistant",
+            content: trimmedText,
+            usage,
+            subAgentId: subAgentMetadata?.subAgentId,
+            subAgentName: subAgentMetadata?.subAgentName,
+            createdAt: recordTimestamp,
+          });
+        }
+      }
+
+      if (step.toolCalls?.length) {
+        for (const toolCall of step.toolCalls) {
+          oc.conversationSteps?.push({
+            id: toolCall.toolCallId || randomUUID(),
+            type: "tool_call",
+            content: safeStringify(toolCall.input ?? {}),
+            role: "assistant",
+            name: toolCall.toolName,
+            arguments: (toolCall as { input?: Record<string, unknown> }).input || {},
+            usage,
+            ...(subAgentMetadata ?? {}),
+          });
+
+          if (oc.userId && oc.conversationId) {
+            stepRecords.push({
+              id: toolCall.toolCallId || randomUUID(),
+              conversationId: oc.conversationId,
+              userId: oc.userId,
+              agentId: this.id,
+              agentName: this.name,
+              operationId: oc.operationId,
+              stepIndex,
+              type: "tool_call",
+              role: "assistant",
+              arguments: (toolCall as { input?: Record<string, unknown> }).input || {},
+              usage,
+              subAgentId: subAgentMetadata?.subAgentId,
+              subAgentName: subAgentMetadata?.subAgentName,
+              createdAt: recordTimestamp,
+            });
+          }
+        }
+      }
+
+      if (step.toolResults?.length) {
+        for (const toolResult of step.toolResults) {
+          oc.conversationSteps?.push({
+            id: toolResult.toolCallId || randomUUID(),
+            type: "tool_result",
+            content: safeStringify(toolResult.output),
+            role: "assistant",
+            name: toolResult.toolName,
+            result: toolResult.output,
+            usage,
+            ...(subAgentMetadata ?? {}),
+          });
+
+          if (oc.userId && oc.conversationId) {
+            stepRecords.push({
+              id: toolResult.toolCallId || randomUUID(),
+              conversationId: oc.conversationId,
+              userId: oc.userId,
+              agentId: this.id,
+              agentName: this.name,
+              operationId: oc.operationId,
+              stepIndex,
+              type: "tool_result",
+              role: "assistant",
+              result: toolResult.output ?? null,
+              usage,
+              subAgentId: subAgentMetadata?.subAgentId,
+              subAgentName: subAgentMetadata?.subAgentName,
+              createdAt: recordTimestamp,
+            });
+          }
+        }
+      }
+
+      // Refresh timestamp for multi-step batches to maintain ordering while avoiding identical references
+      recordTimestamp = new Date().toISOString();
+    });
+
+    if (stepRecords.length > 0 && oc.userId && oc.conversationId) {
+      void this.memoryManager
+        .saveConversationSteps(oc, stepRecords, oc.userId, oc.conversationId)
+        .catch((error) => {
+          oc.logger.debug("Failed to persist conversation steps", {
+            error,
+            conversationId: oc.conversationId,
+            userId: oc.userId,
+          });
+        });
+    }
   }
 
   /**
