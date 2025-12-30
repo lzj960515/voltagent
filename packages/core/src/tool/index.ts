@@ -1,6 +1,5 @@
-import type { ProviderOptions } from "@ai-sdk/provider-utils";
+import type { ProviderOptions, ToolNeedsApprovalFunction } from "@ai-sdk/provider-utils";
 import type { Tool as VercelTool } from "ai";
-import { v4 as uuidv4 } from "uuid";
 import type { z } from "zod";
 import type { BaseTool, ToolExecuteOptions, ToolSchema } from "../agent/providers/base/types";
 import { LoggerProxy } from "../logger";
@@ -42,7 +41,13 @@ export type AgentTool = BaseTool;
 /**
  * Block access to user-defined and dynamic tools by requiring provider-defined type
  * */
-export type ProviderTool = Extract<VercelTool, { type: "provider-defined" }>;
+export type ProviderTool = VercelTool & {
+  type: "provider";
+  id: `${string}.${string}`;
+  args: Record<string, unknown>;
+  supportsDeferredResults?: boolean;
+  name: string;
+};
 
 /**
  * Tool options for creating a new tool
@@ -82,6 +87,12 @@ export type ToolOptions<
   tags?: string[];
 
   /**
+   * Whether the tool requires approval before execution.
+   * When set to a function, it can decide dynamically per call.
+   */
+  needsApproval?: boolean | ToolNeedsApprovalFunction<z.infer<T>>;
+
+  /**
    * Provider-specific options for the tool.
    * Enables provider-specific functionality like cache control.
    *
@@ -106,16 +117,18 @@ export type ToolOptions<
    * @example
    * ```typescript
    * // Return image + text
-   * toModelOutput: (result) => ({
+   * toModelOutput: ({ output }) => ({
    *   type: 'content',
    *   value: [
    *     { type: 'text', text: 'Screenshot taken' },
-   *     { type: 'media', data: result.base64Image, mediaType: 'image/png' }
+   *     { type: 'media', data: output.base64Image, mediaType: 'image/png' }
    *   ]
    * })
    * ```
    */
-  toModelOutput?: (output: O extends ToolSchema ? z.infer<O> : unknown) => ToolResultOutput;
+  toModelOutput?: (args: {
+    output: O extends ToolSchema ? z.infer<O> : unknown;
+  }) => ToolResultOutput;
 
   /**
    * Function to execute when the tool is called.
@@ -164,6 +177,11 @@ export class Tool<T extends ToolSchema = ToolSchema, O extends ToolSchema | unde
   readonly tags?: string[];
 
   /**
+   * Whether the tool requires approval before execution.
+   */
+  readonly needsApproval?: boolean | ToolNeedsApprovalFunction<z.infer<T>>;
+
+  /**
    * Provider-specific options for the tool.
    * Enables provider-specific functionality like cache control.
    */
@@ -173,9 +191,9 @@ export class Tool<T extends ToolSchema = ToolSchema, O extends ToolSchema | unde
    * Optional function to convert tool output to multi-modal content.
    * Enables returning images, media, or structured content to the LLM.
    */
-  readonly toModelOutput?: (
-    output: O extends ToolSchema ? z.infer<O> : unknown,
-  ) => ToolResultOutput;
+  readonly toModelOutput?: (args: {
+    output: O extends ToolSchema ? z.infer<O> : unknown;
+  }) => ToolResultOutput;
 
   /**
    * Internal discriminator to make runtime/type checks simpler across module boundaries.
@@ -216,12 +234,13 @@ export class Tool<T extends ToolSchema = ToolSchema, O extends ToolSchema | unde
       throw new Error(`Tool '${options.name}' parameters schema is required`);
     }
 
-    this.id = options.id || uuidv4();
+    this.id = options.id ?? options.name;
     this.name = options.name;
     this.description = options.description || "";
     this.parameters = options.parameters;
     this.outputSchema = options.outputSchema;
     this.tags = options.tags;
+    this.needsApproval = options.needsApproval;
     this.providerOptions = options.providerOptions;
     this.toModelOutput = options.toModelOutput;
     this.execute = options.execute;

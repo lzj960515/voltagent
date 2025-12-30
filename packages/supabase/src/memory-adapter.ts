@@ -591,7 +591,7 @@ END OF MIGRATION SQL
     userId: string,
     conversationId: string,
     options?: GetMessagesOptions,
-  ): Promise<UIMessage[]> {
+  ): Promise<UIMessage<{ createdAt: Date }>[]> {
     await this.initialize();
 
     const messagesTable = `${this.baseTableName}_messages`;
@@ -676,7 +676,10 @@ END OF MIGRATION SQL
         id: row.message_id,
         role: row.role as "system" | "user" | "assistant",
         parts,
-        metadata: row.metadata || {},
+        metadata: {
+          ...(row.metadata || {}),
+          createdAt: row.created_at ? new Date(row.created_at) : undefined,
+        },
       };
     });
   }
@@ -1246,6 +1249,73 @@ END OF MIGRATION SQL
       createdAt: new Date(data.created_at),
       updatedAt: new Date(data.updated_at),
     };
+  }
+
+  /**
+   * Query workflow states with optional filters
+   */
+  async queryWorkflowRuns(query: {
+    workflowId?: string;
+    status?: WorkflowStateEntry["status"];
+    from?: Date;
+    to?: Date;
+    limit?: number;
+    offset?: number;
+  }): Promise<WorkflowStateEntry[]> {
+    await this.initialize();
+
+    const workflowStatesTable = `${this.baseTableName}_workflow_states`;
+    let queryBuilder = this.client.from(workflowStatesTable).select("*");
+
+    if (query.workflowId) {
+      queryBuilder = queryBuilder.eq("workflow_id", query.workflowId);
+    }
+
+    if (query.status) {
+      queryBuilder = queryBuilder.eq("status", query.status);
+    }
+
+    if (query.from) {
+      queryBuilder = queryBuilder.gte("created_at", query.from.toISOString());
+    }
+
+    if (query.to) {
+      queryBuilder = queryBuilder.lte("created_at", query.to.toISOString());
+    }
+
+    queryBuilder = queryBuilder.order("created_at", { ascending: false });
+
+    if (query.limit !== undefined) {
+      const offset = query.offset ?? 0;
+      const toIndex = offset + query.limit - 1;
+      queryBuilder = queryBuilder.range(offset, toIndex);
+    } else if (query.offset !== undefined) {
+      // Supabase doesn't support offset without limit; set a large limit
+      const offset = query.offset;
+      queryBuilder = queryBuilder.range(offset, offset + 999);
+    }
+
+    const { data, error } = await queryBuilder;
+
+    if (error) {
+      throw new Error(`Failed to get workflow states: ${error.message}`);
+    }
+
+    return (data || []).map((row) => ({
+      id: row.id,
+      workflowId: row.workflow_id,
+      workflowName: row.workflow_name,
+      status: row.status as WorkflowStateEntry["status"],
+      suspension: row.suspension || undefined,
+      events: row.events || undefined,
+      output: row.output || undefined,
+      cancellation: row.cancellation || undefined,
+      userId: row.user_id || undefined,
+      conversationId: row.conversation_id || undefined,
+      metadata: row.metadata || undefined,
+      createdAt: new Date(row.created_at),
+      updatedAt: new Date(row.updated_at),
+    }));
   }
 
   /**

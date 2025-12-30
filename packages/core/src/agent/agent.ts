@@ -2,28 +2,31 @@ import type {
   ModelMessage,
   ProviderOptions,
   SystemModelMessage,
-  ToolCallOptions,
+  ToolExecutionOptions,
 } from "@ai-sdk/provider-utils";
 import type { Span } from "@opentelemetry/api";
-import { SpanKind, SpanStatusCode } from "@opentelemetry/api";
+import { SpanKind, SpanStatusCode, context as otelContext } from "@opentelemetry/api";
 import type { Logger } from "@voltagent/internal";
 import { safeStringify } from "@voltagent/internal/utils";
 import type {
   StreamTextResult as AIStreamTextResult,
+  Tool as AITool,
   CallSettings,
   GenerateObjectResult,
   GenerateTextResult,
   LanguageModel,
+  PrepareStepFunction,
   StepResult,
+  ToolChoice,
   ToolSet,
   UIMessage,
 } from "ai";
 import {
   type AsyncIterableStream,
-  type CallWarning,
   type FinishReason,
   type LanguageModelUsage,
   type Output,
+  type Warning,
   convertToModelMessages,
   createTextStreamResponse,
   createUIMessageStream,
@@ -42,9 +45,11 @@ import { ActionType, buildAgentLogMessage } from "../logger/message-builder";
 import type { Memory, MemoryUpdateMode } from "../memory";
 import { MemoryManager } from "../memory/manager/memory-manager";
 import { type VoltAgentObservability, createVoltAgentObservability } from "../observability";
+import { TRIGGER_CONTEXT_KEY } from "../observability/context-keys";
+import { type ObservabilityFlushState, flushObservability } from "../observability/utils";
 import { AgentRegistry } from "../registries/agent-registry";
 import type { BaseRetriever } from "../retriever/retriever";
-import type { Tool, Toolkit } from "../tool";
+import type { Tool, Toolkit, VercelTool } from "../tool";
 import { createTool } from "../tool";
 import { ToolManager } from "../tool/manager";
 import { randomUUID } from "../utils/id";
@@ -55,6 +60,7 @@ import type { Voice } from "../voice";
 import { VoltOpsClient as VoltOpsClientClass } from "../voltops/client";
 import type { VoltOpsClient } from "../voltops/client";
 import type { PromptContent, PromptHelper } from "../voltops/types";
+import { buildToolErrorResult } from "./error-utils";
 import {
   createAbortError,
   createBailError,
@@ -82,6 +88,8 @@ import { P, match } from "ts-pattern";
 import type { StopWhen } from "../ai-types";
 import type { SamplingPolicy } from "../eval/runtime";
 import type { ConversationStepRecord } from "../memory/types";
+import { applySummarization } from "./apply-summarization";
+import { FORCED_TOOL_CHOICE_CONTEXT_KEY } from "./context-keys";
 import { ConversationBuffer } from "./conversation-buffer";
 import {
   type NormalizedInputGuardrail,
@@ -111,6 +119,7 @@ import type {
   AgentFullState,
   AgentGuardrailState,
   AgentOptions,
+  AgentSummarizationOptions,
   DynamicValue,
   DynamicValueOptions,
   InputGuardrail,
@@ -127,6 +136,13 @@ const STEP_PERSIST_COUNT_KEY = Symbol("persistedStepCount");
 // ============================================================================
 // Types
 // ============================================================================
+
+type OutputSpec =
+  | ReturnType<typeof Output.text>
+  | ReturnType<typeof Output.object>
+  | ReturnType<typeof Output.array>
+  | ReturnType<typeof Output.choice>
+  | ReturnType<typeof Output.json>;
 
 /**
  * Context input type that accepts both Map and plain object
@@ -153,27 +169,21 @@ function toContextMap(context?: ContextInput): Map<string | symbol, unknown> | u
  */
 export interface StreamTextResultWithContext<
   TOOLS extends ToolSet = Record<string, any>,
-  PARTIAL_OUTPUT = any,
+  OUTPUT extends OutputSpec = OutputSpec,
 > {
   // All methods from AIStreamTextResult
-  readonly text: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["text"];
-  readonly textStream: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["textStream"];
+  readonly text: AIStreamTextResult<TOOLS, OUTPUT>["text"];
+  readonly textStream: AIStreamTextResult<TOOLS, OUTPUT>["textStream"];
   readonly fullStream: AsyncIterable<VoltAgentTextStreamPart<TOOLS>>;
-  readonly usage: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["usage"];
-  readonly finishReason: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["finishReason"];
-  // Experimental partial output stream for streaming structured objects
-  readonly experimental_partialOutputStream?: AIStreamTextResult<
-    TOOLS,
-    PARTIAL_OUTPUT
-  >["experimental_partialOutputStream"];
-  toUIMessageStream: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["toUIMessageStream"];
-  toUIMessageStreamResponse: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["toUIMessageStreamResponse"];
-  pipeUIMessageStreamToResponse: AIStreamTextResult<
-    TOOLS,
-    PARTIAL_OUTPUT
-  >["pipeUIMessageStreamToResponse"];
-  pipeTextStreamToResponse: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["pipeTextStreamToResponse"];
-  toTextStreamResponse: AIStreamTextResult<TOOLS, PARTIAL_OUTPUT>["toTextStreamResponse"];
+  readonly usage: AIStreamTextResult<TOOLS, OUTPUT>["usage"];
+  readonly finishReason: AIStreamTextResult<TOOLS, OUTPUT>["finishReason"];
+  // Partial output stream for streaming structured objects
+  readonly partialOutputStream?: AIStreamTextResult<TOOLS, OUTPUT>["partialOutputStream"];
+  toUIMessageStream: AIStreamTextResult<TOOLS, OUTPUT>["toUIMessageStream"];
+  toUIMessageStreamResponse: AIStreamTextResult<TOOLS, OUTPUT>["toUIMessageStreamResponse"];
+  pipeUIMessageStreamToResponse: AIStreamTextResult<TOOLS, OUTPUT>["pipeUIMessageStreamToResponse"];
+  pipeTextStreamToResponse: AIStreamTextResult<TOOLS, OUTPUT>["pipeTextStreamToResponse"];
+  toTextStreamResponse: AIStreamTextResult<TOOLS, OUTPUT>["toTextStreamResponse"];
   // Additional context field
   context: Map<string | symbol, unknown>;
 }
@@ -186,7 +196,7 @@ export interface StreamObjectResultWithContext<T> {
   readonly object: Promise<T>;
   readonly partialObjectStream: ReadableStream<Partial<T>>;
   readonly textStream: AsyncIterableStream<string>;
-  readonly warnings: Promise<CallWarning[] | undefined>;
+  readonly warnings: Promise<Warning[] | undefined>;
   readonly usage: Promise<LanguageModelUsage>;
   readonly finishReason: Promise<FinishReason>;
   // Response conversion methods
@@ -201,7 +211,7 @@ export interface StreamObjectResultWithContext<T> {
  */
 export type GenerateTextResultWithContext<
   TOOLS extends ToolSet = Record<string, any>,
-  OUTPUT = any,
+  OUTPUT extends OutputSpec = OutputSpec,
 > = GenerateTextResult<TOOLS, OUTPUT> & {
   // Additional context field
   context: Map<string | symbol, unknown>;
@@ -219,7 +229,7 @@ export interface GenerateObjectResultWithContext<T> extends GenerateObjectResult
 
 function cloneGenerateTextResultWithContext<
   TOOLS extends ToolSet = Record<string, any>,
-  OUTPUT = any,
+  OUTPUT extends OutputSpec = OutputSpec,
 >(
   result: GenerateTextResult<TOOLS, OUTPUT>,
   overrides: Partial<
@@ -249,6 +259,37 @@ function cloneGenerateTextResultWithContext<
   }
 
   return clone;
+}
+
+type AITextCallOptions = Partial<CallSettings> & {
+  toolChoice?: ToolChoice<Record<string, unknown>>;
+  prepareStep?: PrepareStepFunction<Record<string, AITool>>;
+};
+
+function applyForcedToolChoice(
+  aiSDKOptions: AITextCallOptions,
+  forcedToolChoice: ToolChoice<Record<string, unknown>> | undefined,
+): void {
+  if (!forcedToolChoice || aiSDKOptions.toolChoice !== undefined) {
+    return;
+  }
+
+  const userPrepareStep = aiSDKOptions.prepareStep;
+  aiSDKOptions.prepareStep = async (
+    options: Parameters<PrepareStepFunction<Record<string, AITool>>>[0],
+  ) => {
+    const prepared = userPrepareStep ? await userPrepareStep(options) : undefined;
+    const isFirstStep = options.steps.length === 0;
+    if (!isFirstStep || prepared?.toolChoice !== undefined) {
+      return prepared;
+    }
+
+    if (prepared) {
+      return { ...prepared, toolChoice: forcedToolChoice };
+    }
+
+    return { toolChoice: forcedToolChoice };
+  };
 }
 
 /**
@@ -302,8 +343,8 @@ export interface BaseGenerationOptions extends Partial<CallSettings> {
   // Provider-specific options
   providerOptions?: ProviderOptions;
 
-  // Experimental output (for structured generation)
-  experimental_output?: ReturnType<typeof Output.object> | ReturnType<typeof Output.text>;
+  // Structured output (for schema-guided generation)
+  output?: OutputSpec;
 
   // === Inherited from AI SDK CallSettings ===
   // maxOutputTokens, temperature, topP, topK,
@@ -314,6 +355,11 @@ export interface BaseGenerationOptions extends Partial<CallSettings> {
    * Mirrors the `stop` option supported by ai-sdk `generateText/streamText`.
    */
   stop?: string | string[];
+
+  /**
+   * Tool choice strategy for AI SDK calls.
+   */
+  toolChoice?: ToolChoice<Record<string, unknown>>;
 }
 
 export type GenerateTextOptions = BaseGenerationOptions;
@@ -350,6 +396,7 @@ export class Agent {
   private readonly logger: Logger;
   private readonly memoryManager: MemoryManager;
   private readonly memory?: Memory | false;
+  private readonly summarization?: AgentSummarizationOptions | false;
   private defaultObservability?: VoltAgentObservability;
   private readonly toolManager: ToolManager;
   private readonly subAgentManager: SubAgentManager;
@@ -358,6 +405,9 @@ export class Agent {
   private readonly evalConfig?: AgentEvalConfig;
   private readonly inputGuardrails: NormalizedInputGuardrail[];
   private readonly outputGuardrails: NormalizedOutputGuardrail[];
+  private readonly observabilityAuthWarningState: ObservabilityFlushState = {
+    authWarningLogged: false,
+  };
 
   constructor(options: AgentOptions) {
     this.id = options.id || options.name;
@@ -404,6 +454,7 @@ export class Agent {
 
     // Store Memory
     this.memory = options.memory;
+    this.summarization = options.summarization;
 
     // Initialize memory manager
     this.memoryManager = new MemoryManager(this.id, this.memory, {}, this.logger);
@@ -542,10 +593,15 @@ export class Agent {
           hooks,
           maxSteps: userMaxSteps,
           tools: userTools,
-          experimental_output,
+          output,
           providerOptions,
           ...aiSDKOptions
         } = options || {};
+
+        const forcedToolChoice = oc.systemContext.get(FORCED_TOOL_CHOICE_CONTEXT_KEY) as
+          | ToolChoice<Record<string, unknown>>
+          | undefined;
+        applyForcedToolChoice(aiSDKOptions, forcedToolChoice);
 
         const llmSpan = this.createLLMSpan(oc, {
           operation: "generateText",
@@ -563,7 +619,7 @@ export class Agent {
         });
         const finalizeLLMSpan = this.createLLMSpanFinalizer(llmSpan);
 
-        let result!: GenerateTextResult<ToolSet, unknown>;
+        let result!: GenerateTextResult<ToolSet, OutputSpec>;
         try {
           result = await oc.traceContext.withSpan(llmSpan, () =>
             generateText({
@@ -577,8 +633,8 @@ export class Agent {
               stopWhen: options?.stopWhen ?? this.stopWhen ?? stepCountIs(maxSteps),
               // User overrides from AI SDK options
               ...aiSDKOptions,
-              // Experimental output if provided
-              experimental_output,
+              // Structured output if provided
+              output,
               // Provider-specific options
               providerOptions,
               // VoltAgent controlled (these should not be overridden)
@@ -755,6 +811,15 @@ export class Agent {
 
         await this.flushPendingMessagesOnError(oc).catch(() => {});
         return this.handleError(error as Error, oc, options, startTime);
+      } finally {
+        // Ensure all spans are exported before returning (critical for serverless)
+        // Uses waitUntil if available to avoid blocking
+        await flushObservability(
+          this.getObservability(),
+          oc.logger ?? this.logger,
+          this.observabilityAuthWarningState,
+          "generateText:finally",
+        );
       }
     });
   }
@@ -862,15 +927,20 @@ export class Agent {
           maxSteps: userMaxSteps,
           tools: userTools,
           onFinish: userOnFinish,
-          experimental_output,
+          output,
           providerOptions,
           ...aiSDKOptions
         } = options || {};
 
+        const forcedToolChoice = oc.systemContext.get(FORCED_TOOL_CHOICE_CONTEXT_KEY) as
+          | ToolChoice<Record<string, unknown>>
+          | undefined;
+        applyForcedToolChoice(aiSDKOptions, forcedToolChoice);
+
         const guardrailStreamingEnabled = guardrailSet.output.length > 0;
 
         let guardrailPipeline: GuardrailPipeline | null = null;
-        let sanitizedTextPromise!: Promise<string>;
+        let sanitizedTextPromise!: PromiseLike<string>;
 
         const llmSpan = this.createLLMSpan(oc, {
           operation: "streamText",
@@ -899,14 +969,14 @@ export class Agent {
           stopWhen: options?.stopWhen ?? this.stopWhen ?? stepCountIs(maxSteps),
           // User overrides from AI SDK options
           ...aiSDKOptions,
-          // Experimental output if provided
-          experimental_output,
+          // Structured output if provided
+          output,
           // Provider-specific options
           providerOptions,
           // VoltAgent controlled (these should not be overridden)
           abortSignal: oc.abortController.signal,
           onStepFinish: this.createStepHandler(oc, options),
-          onError: (errorData) => {
+          onError: async (errorData) => {
             // Handle nested error structure from OpenAI and other providers
             // The error might be directly the error or wrapped in { error: ... }
             const actualError = (errorData as any)?.error || errorData;
@@ -949,6 +1019,14 @@ export class Agent {
 
             // Don't re-throw - let the error be part of the stream
             // The onError callback should return void for AI SDK compatibility
+            // Ensure spans are flushed on error
+            // Uses waitUntil if available to avoid blocking
+            await flushObservability(
+              this.getObservability(),
+              oc.logger ?? this.logger,
+              this.observabilityAuthWarningState,
+              "streamText:onError",
+            );
           },
           onFinish: async (finalResult) => {
             const providerUsage = finalResult.usage
@@ -1099,6 +1177,15 @@ export class Agent {
             });
 
             oc.traceContext.end("completed");
+
+            // Ensure all spans are exported on finish
+            // Uses waitUntil if available to avoid blocking
+            await flushObservability(
+              this.getObservability(),
+              oc.logger ?? this.logger,
+              this.observabilityAuthWarningState,
+              "streamText:onFinish",
+            );
           },
         });
 
@@ -1368,8 +1455,8 @@ export class Agent {
           },
           usage: result.usage,
           finishReason: result.finishReason,
-          get experimental_partialOutputStream() {
-            return result.experimental_partialOutputStream;
+          get partialOutputStream() {
+            return result.partialOutputStream;
           },
           toUIMessageStream: toUIMessageStreamSanitized as typeof result.toUIMessageStream,
           toUIMessageStreamResponse:
@@ -1395,13 +1482,23 @@ export class Agent {
         return resultWithContext;
       } catch (error) {
         await this.flushPendingMessagesOnError(oc).catch(() => {});
+        // Ensure spans are exported on pre-stream errors
+        await flushObservability(
+          this.getObservability(),
+          oc.logger ?? this.logger,
+          this.observabilityAuthWarningState,
+          "streamText:preStreamError",
+        );
         return this.handleError(error as Error, oc, options, startTime);
+      } finally {
+        // No need to flush here for streams - handled in onFinish/onError
       }
     });
   }
 
   /**
    * Generate structured object
+   * @deprecated Use generateText with Output.object instead. generateObject will be removed in a future release.
    */
   async generateObject<T extends z.ZodType>(
     input: string | UIMessage[] | BaseMessage[],
@@ -1489,6 +1586,7 @@ export class Agent {
           hooks,
           maxSteps: userMaxSteps,
           tools: userTools,
+          output: _output,
           providerOptions,
           ...aiSDKOptions
         } = options || {};
@@ -1496,7 +1594,6 @@ export class Agent {
         const result = await generateObject({
           model,
           messages,
-          output: "object",
           schema,
           // Default values
           maxOutputTokens: this.maxOutputTokens,
@@ -1619,12 +1716,22 @@ export class Agent {
       } catch (error) {
         await this.flushPendingMessagesOnError(oc).catch(() => {});
         return this.handleError(error as Error, oc, options, startTime);
+      } finally {
+        // Ensure all spans are exported before returning (critical for serverless)
+        // Uses waitUntil if available to avoid blocking
+        await flushObservability(
+          this.getObservability(),
+          oc.logger ?? this.logger,
+          this.observabilityAuthWarningState,
+          "generateObject:finally",
+        );
       }
     });
   }
 
   /**
    * Stream structured object
+   * @deprecated Use streamText with Output.object instead. streamObject will be removed in a future release.
    */
   async streamObject<T extends z.ZodType>(
     input: string | UIMessage[] | BaseMessage[],
@@ -1714,6 +1821,7 @@ export class Agent {
           maxSteps: userMaxSteps,
           tools: userTools,
           onFinish: userOnFinish,
+          output: _output,
           providerOptions,
           ...aiSDKOptions
         } = options || {};
@@ -1725,7 +1833,6 @@ export class Agent {
         const result = streamObject({
           model,
           messages,
-          output: "object",
           schema,
           // Default values
           maxOutputTokens: this.maxOutputTokens,
@@ -1737,7 +1844,7 @@ export class Agent {
           providerOptions,
           // VoltAgent controlled
           abortSignal: oc.abortController.signal,
-          onError: (errorData) => {
+          onError: async (errorData) => {
             // Handle nested error structure from OpenAI and other providers
             // The error might be directly the error or wrapped in { error: ... }
             const actualError = (errorData as any)?.error || errorData;
@@ -1767,6 +1874,14 @@ export class Agent {
 
             // Don't re-throw - let the error be part of the stream
             // The onError callback should return void for AI SDK compatibility
+            // Ensure spans are flushed on error
+            // Uses waitUntil if available to avoid blocking
+            await flushObservability(
+              this.getObservability(),
+              oc.logger ?? this.logger,
+              this.observabilityAuthWarningState,
+              "streamObject:onError",
+            );
           },
           onFinish: async (finalResult: any) => {
             try {
@@ -1873,6 +1988,15 @@ export class Agent {
               });
 
               oc.traceContext.end("completed");
+
+              // Ensure all spans are exported on finish
+              // Uses waitUntil if available to avoid blocking
+              await flushObservability(
+                this.getObservability(),
+                oc.logger ?? this.logger,
+                this.observabilityAuthWarningState,
+                "streamObject:onFinish",
+              );
             } catch (error) {
               rejectGuardrailObject?.(error);
               throw error;
@@ -1915,7 +2039,16 @@ export class Agent {
         return resultWithContext;
       } catch (error) {
         await this.flushPendingMessagesOnError(oc).catch(() => {});
+        // Ensure spans are exported on pre-stream errors
+        await flushObservability(
+          this.getObservability(),
+          oc.logger ?? this.logger,
+          this.observabilityAuthWarningState,
+          "streamObject:preStreamError",
+        );
         return this.handleError(error as Error, oc, options, 0);
+      } finally {
+        // No need to flush here for streams - handled in onFinish/onError
       }
     });
   }
@@ -1964,7 +2097,7 @@ export class Agent {
 
     // Convert UIMessages to ModelMessages for the LLM
     const hooks = this.getMergedHooks(options);
-    let messages = convertToModelMessages(uiMessages);
+    let messages = await convertToModelMessages(uiMessages);
 
     if (hooks.onPrepareModelMessages) {
       const result = await hooks.onPrepareModelMessages({
@@ -2001,7 +2134,7 @@ export class Agent {
     };
   }
 
-  private collectToolDataFromResult<TOOLS extends ToolSet, OUTPUT>(
+  private collectToolDataFromResult<TOOLS extends ToolSet, OUTPUT extends OutputSpec>(
     result: GenerateTextResult<TOOLS, OUTPUT>,
   ): {
     toolCalls: GenerateTextResult<TOOLS, OUTPUT>["toolCalls"];
@@ -2068,6 +2201,15 @@ export class Agent {
     } else {
       // No context provided anywhere; create a fresh one
       context = new Map();
+    }
+
+    const activeTriggerContext = otelContext.active().getValue(TRIGGER_CONTEXT_KEY);
+    if (activeTriggerContext instanceof Map) {
+      for (const [key, value] of activeTriggerContext.entries()) {
+        if (!context.has(key)) {
+          context.set(key, value);
+        }
+      }
     }
 
     const logger = this.getContextualLogger(options?.parentAgentId).child({
@@ -2344,31 +2486,14 @@ export class Agent {
       return;
     }
 
-    const coerce = (value: unknown): number | undefined => {
-      if (typeof value === "number" && Number.isFinite(value)) {
-        return value;
-      }
-      if (typeof value === "string") {
-        const parsed = Number(value);
-        return Number.isFinite(parsed) ? parsed : undefined;
-      }
-      return undefined;
-    };
+    const normalizedUsage =
+      "promptTokens" in usage ? (usage as UsageInfo) : convertUsage(usage as LanguageModelUsage);
 
-    const promptTokens =
-      coerce((usage as any).promptTokens) ??
-      coerce((usage as any).prompt) ??
-      coerce((usage as any).inputTokens) ??
-      coerce((usage as any).input_tokens);
-    const completionTokens =
-      coerce((usage as any).completionTokens) ??
-      coerce((usage as any).completion) ??
-      coerce((usage as any).outputTokens) ??
-      coerce((usage as any).output_tokens);
-    const totalTokens =
-      coerce((usage as any).totalTokens) ??
-      coerce((usage as any).total_tokens) ??
-      (promptTokens ?? 0) + (completionTokens ?? 0);
+    if (!normalizedUsage) {
+      return;
+    }
+
+    const { promptTokens, completionTokens, totalTokens } = normalizedUsage;
 
     if (promptTokens !== undefined) {
       span.setAttribute("llm.usage.prompt_tokens", promptTokens);
@@ -2665,7 +2790,22 @@ export class Agent {
     } else if (Array.isArray(input)) {
       const first = (input as any[])[0];
       if (first && Array.isArray(first.parts)) {
-        messages.push(...(input as UIMessage[]));
+        const inputMessages = input as UIMessage[];
+        const idsToReplace = new Set(
+          inputMessages
+            .map((message) => message.id)
+            .filter((id): id is string => typeof id === "string" && id.trim().length > 0),
+        );
+
+        if (idsToReplace.size > 0) {
+          for (let index = messages.length - 1; index >= 0; index--) {
+            if (idsToReplace.has(messages[index].id)) {
+              messages.splice(index, 1);
+            }
+          }
+        }
+
+        messages.push(...inputMessages);
       } else {
         messages.push(...convertModelMessagesToUIMessages(input as BaseMessage[]));
       }
@@ -2673,20 +2813,28 @@ export class Agent {
 
     // Sanitize messages before passing them to the model-layer hooks
     const sanitizedMessages = sanitizeMessagesForModel(messages);
+    const summarizedMessages = await applySummarization({
+      messages: sanitizedMessages,
+      operationContext: oc,
+      summarization: this.summarization,
+      model: this.model,
+      resolveValue: this.resolveValue.bind(this),
+      agent: this,
+    });
 
     // Allow hooks to modify sanitized messages (while exposing the raw set when needed)
     const hooks = this.getMergedHooks(options);
     if (hooks.onPrepareMessages) {
       const result = await hooks.onPrepareMessages({
-        messages: sanitizedMessages,
+        messages: summarizedMessages,
         rawMessages: messages,
         agent: this,
         context: oc,
       });
-      return result?.messages || sanitizedMessages;
+      return result?.messages || summarizedMessages;
     }
 
-    return sanitizedMessages;
+    return summarizedMessages;
   }
 
   /**
@@ -2845,45 +2993,62 @@ export class Agent {
       }
 
       if (promptContent.type === "text") {
-        let content = promptContent.text || "";
-
-        // Add toolkit instructions
-        content = this.addToolkitInstructions(content);
-
-        // Add markdown instruction
-        if (this.markdown) {
-          content = `${content}\n\nUse markdown to format your answers.`;
-        }
-
-        // Add retriever context
-        if (retrieverContext) {
-          content = `${content}\n\nRelevant Context:\n${retrieverContext}`;
-        }
-
-        // Add working memory context
-        if (workingMemoryContext) {
-          content = `${content}${workingMemoryContext}`;
-        }
-
-        // Add supervisor instructions if needed
-        if (this.subAgentManager.hasSubAgents()) {
-          const agentsMemory = await this.prepareAgentsMemory(oc);
-          content = this.subAgentManager.generateSupervisorSystemMessage(
-            content,
-            agentsMemory,
-            this.supervisorConfig,
-          );
-        }
+        const baseContent = promptContent.text || "";
+        const content = await this.enrichInstructions(
+          baseContent,
+          retrieverContext,
+          workingMemoryContext,
+          oc,
+        );
 
         return {
           role: "system",
-          content: `You are ${this.name}. ${content}`,
+          content: `${content}`,
         };
       }
     }
 
     // Default string instructions
-    let content = typeof resolvedInstructions === "string" ? resolvedInstructions : "";
+    const baseContent = typeof resolvedInstructions === "string" ? resolvedInstructions : "";
+    const content = await this.enrichInstructions(
+      baseContent,
+      retrieverContext,
+      workingMemoryContext,
+      oc,
+    );
+
+    return {
+      role: "system",
+      content: `${content}`,
+    };
+  }
+
+  /**
+   * Add toolkit instructions
+   */
+  private addToolkitInstructions(baseInstructions: string): string {
+    const toolkits = this.toolManager.getToolkits();
+    let toolInstructions = "";
+
+    for (const toolkit of toolkits) {
+      if (toolkit.addInstructions && toolkit.instructions) {
+        toolInstructions += `\n\n${toolkit.instructions}`;
+      }
+    }
+
+    return baseInstructions + toolInstructions;
+  }
+
+  /**
+   * Enrich instructions with additional context and modifiers
+   */
+  private async enrichInstructions(
+    baseContent: string,
+    retrieverContext: string | null,
+    workingMemoryContext: string | null,
+    oc: OperationContext,
+  ): Promise<string> {
+    let content = baseContent;
 
     // Add toolkit instructions
     content = this.addToolkitInstructions(content);
@@ -2913,26 +3078,7 @@ export class Agent {
       );
     }
 
-    return {
-      role: "system",
-      content: `You are ${this.name}. ${content}`,
-    };
-  }
-
-  /**
-   * Add toolkit instructions
-   */
-  private addToolkitInstructions(baseInstructions: string): string {
-    const toolkits = this.toolManager.getToolkits();
-    let toolInstructions = "";
-
-    for (const toolkit of toolkits) {
-      if (toolkit.addInstructions && toolkit.instructions) {
-        toolInstructions += `\n\n${toolkit.instructions}`;
-      }
-    }
-
-    return baseInstructions + toolInstructions;
+    return content;
   }
 
   /**
@@ -2983,6 +3129,7 @@ export class Agent {
       attributes: {
         "retriever.name": this.retriever.tool.name || "Retriever",
         input: typeof input === "string" ? input : safeStringify(input),
+        ...this.getRetrieverObservabilityAttributes(),
       },
     });
 
@@ -2995,13 +3142,13 @@ export class Agent {
           ? input
           : Array.isArray(input) && (input as any[])[0]?.content !== undefined
             ? (input as BaseMessage[])
-            : convertToModelMessages(input as UIMessage[]);
+            : await convertToModelMessages(input as UIMessage[]);
 
       // Execute retriever with the span context
       const retrievedContent = await oc.traceContext.withSpan(retrieverSpan, async () => {
         if (!this.retriever) return null;
         return await this.retriever.retrieve(retrieverInput, {
-          context: oc.context,
+          ...oc,
           logger: retrieverLogger,
         });
       });
@@ -3010,6 +3157,7 @@ export class Agent {
         const documentCount = retrievedContent
           .split("\n")
           .filter((line: string) => line.trim()).length;
+        const durationMs = Date.now() - startTime;
 
         retrieverLogger.debug(
           buildAgentLogMessage(
@@ -3020,7 +3168,7 @@ export class Agent {
           {
             event: LogEvents.RETRIEVER_SEARCH_COMPLETED,
             documentCount,
-            duration: Date.now() - startTime,
+            duration: durationMs,
           },
         );
 
@@ -3031,6 +3179,7 @@ export class Agent {
           output: retrievedContent,
           attributes: {
             "retriever.document_count": documentCount,
+            ...this.getRetrieverObservabilityAttributes(),
           },
         });
 
@@ -3042,6 +3191,7 @@ export class Agent {
         output: null,
         attributes: {
           "retriever.document_count": 0,
+          ...this.getRetrieverObservabilityAttributes(),
         },
       });
 
@@ -3050,8 +3200,13 @@ export class Agent {
       // Event tracking now handled by OpenTelemetry spans
 
       // End OpenTelemetry span with error
+      const durationMs = Date.now() - startTime;
+
       oc.traceContext.endChildSpan(retrieverSpan, "error", {
         error: error as Error,
+        attributes: {
+          ...this.getRetrieverObservabilityAttributes(),
+        },
       });
 
       retrieverLogger.error(
@@ -3063,13 +3218,27 @@ export class Agent {
         {
           event: LogEvents.RETRIEVER_SEARCH_FAILED,
           error: error instanceof Error ? error.message : String(error),
-          duration: Date.now() - startTime,
+          duration: durationMs,
         },
       );
 
       this.logger.warn("Failed to retrieve context", { error, agentId: this.id });
       return null;
     }
+  }
+
+  private getRetrieverObservabilityAttributes(): Record<string, unknown> {
+    const candidate = this.retriever as
+      | {
+          getObservabilityAttributes?: () => Record<string, unknown>;
+        }
+      | undefined;
+
+    if (candidate && typeof candidate.getObservabilityAttributes === "function") {
+      return candidate.getObservabilityAttributes();
+    }
+
+    return {};
   }
 
   /**
@@ -3167,14 +3336,14 @@ export class Agent {
   private createToolExecutionFactory(
     oc: OperationContext,
     hooks: AgentHooks,
-  ): (tool: BaseTool) => (args: any, options?: ToolCallOptions) => Promise<any> {
-    return (tool: BaseTool) => async (args: any, options?: ToolCallOptions) => {
-      // AI SDK passes ToolCallOptions with fields: toolCallId, messages, abortSignal
+  ): (tool: BaseTool) => (args: any, options?: ToolExecutionOptions) => Promise<any> {
+    return (tool: BaseTool) => async (args: any, options?: ToolExecutionOptions) => {
+      // AI SDK passes ToolExecutionOptions with fields: toolCallId, messages, abortSignal
       const toolCallId = options?.toolCallId ?? randomUUID();
       const messages = options?.messages ?? [];
       const abortSignal = options?.abortSignal;
 
-      // Convert ToolCallOptions to ToolExecuteOptions by merging with OperationContext
+      // Convert ToolExecutionOptions to ToolExecuteOptions by merging with OperationContext
       const executionOptions: ToolExecuteOptions = {
         ...oc,
         toolContext: {
@@ -3242,8 +3411,16 @@ export class Agent {
           return result;
         } catch (e) {
           const error = e instanceof Error ? e : new Error(String(e));
-          // POJO error
-          const errorResult = { error: true, ...error };
+          const voltAgentError = createVoltAgentError(error, {
+            stage: "tool_execution",
+            toolError: {
+              toolCallId,
+              toolName: tool.name,
+              toolExecutionError: error,
+              toolArguments: args,
+            },
+          });
+          const errorResult = buildToolErrorResult(error, toolCallId, tool.name);
 
           toolSpan.setStatus({ code: SpanStatusCode.ERROR, message: error.message });
           toolSpan.recordException(error);
@@ -3253,7 +3430,7 @@ export class Agent {
             agent: this,
             tool,
             output: undefined,
-            error: errorResult as any,
+            error: voltAgentError,
             context: oc,
             options: executionOptions,
           });
@@ -3919,7 +4096,9 @@ export class Agent {
   /**
    * Add tools or toolkits to the agent
    */
-  public addTools(tools: (Tool<any, any> | Toolkit)[]): { added: (Tool<any, any> | Toolkit)[] } {
+  public addTools(tools: (Tool<any, any> | Toolkit | VercelTool)[]): {
+    added: (Tool<any, any> | Toolkit | VercelTool)[];
+  } {
     this.toolManager.addItems(tools);
     return { added: tools };
   }
@@ -4157,12 +4336,15 @@ export class Agent {
   private setTraceContextUsage(traceContext: AgentTraceContext, usage?: LanguageModelUsage): void {
     if (!usage) return;
 
+    const resolvedUsage = convertUsage(usage);
+    if (!resolvedUsage) return;
+
     traceContext.setUsage({
-      promptTokens: usage.inputTokens,
-      completionTokens: usage.outputTokens,
-      totalTokens: usage.totalTokens,
-      cachedTokens: usage.cachedInputTokens,
-      reasoningTokens: usage.reasoningTokens,
+      promptTokens: resolvedUsage.promptTokens,
+      completionTokens: resolvedUsage.completionTokens,
+      totalTokens: resolvedUsage.totalTokens,
+      cachedTokens: resolvedUsage.cachedInputTokens,
+      reasoningTokens: resolvedUsage.reasoningTokens,
     });
   }
 

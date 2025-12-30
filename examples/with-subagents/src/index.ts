@@ -21,7 +21,7 @@ const logger = createPinoLogger({
 
 const memory = new Memory({
   storage: new LibSQLMemoryAdapter(),
-  embedding: new AiSdkEmbeddingAdapter(openai.textEmbeddingModel("text-embedding-3-small")),
+  embedding: new AiSdkEmbeddingAdapter(openai.embeddingModel("text-embedding-3-small")),
   vector: new InMemoryVectorAdapter(),
 });
 
@@ -39,6 +39,7 @@ const uppercaseTool = createTool({
 // Create two simple specialized subagents
 const contentCreatorAgent = new Agent({
   name: "ContentCreator",
+  purpose: "Drafts short content",
   instructions: "Creates short text content on requested topics",
   model: openai("gpt-4o-mini"),
   memory,
@@ -46,6 +47,7 @@ const contentCreatorAgent = new Agent({
 
 const formatterAgent = new Agent({
   name: "Formatter",
+  purpose: "Cleans and formats text",
   instructions: "Formats and styles text content",
   model: openai("gpt-4o-mini"),
   tools: [uppercaseTool],

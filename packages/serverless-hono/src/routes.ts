@@ -24,13 +24,17 @@ import {
   AGENT_ROUTES,
   OBSERVABILITY_MEMORY_ROUTES,
   OBSERVABILITY_ROUTES,
+  TOOL_ROUTES,
+  type TriggerHttpRequestContext,
   UPDATE_ROUTES,
   WORKFLOW_ROUTES,
   executeA2ARequest,
+  executeTriggerHandler,
   getConversationMessagesHandler,
   getConversationStepsHandler,
   handleChatStream,
   handleCheckUpdates,
+  handleExecuteTool,
   handleExecuteWorkflow,
   handleGenerateObject,
   handleGenerateText,
@@ -42,6 +46,8 @@ import {
   handleGetWorkflowState,
   handleGetWorkflows,
   handleInstallUpdates,
+  handleListTools,
+  handleListWorkflowRuns,
   handleResumeWorkflow,
   handleStreamObject,
   handleStreamText,
@@ -70,6 +76,24 @@ async function readJsonBody<T>(c: any, logger: Logger): Promise<T | undefined> {
     logger.warn("Invalid JSON body received", { error, path: c.req.path });
     return undefined;
   }
+}
+
+function extractHeaders(
+  headers: Headers | NodeJS.Dict<string | string[] | undefined>,
+): Record<string, string> {
+  if (headers instanceof Headers) {
+    return Object.fromEntries(headers.entries());
+  }
+
+  const result: Record<string, string> = {};
+  Object.entries(headers).forEach(([key, value]) => {
+    if (typeof value === "string") {
+      result[key] = value;
+    } else if (Array.isArray(value)) {
+      result[key] = value.join(", ");
+    }
+  });
+  return result;
 }
 
 function parseContextCandidate(candidate: unknown): A2ARequestContext | undefined {
@@ -258,11 +282,38 @@ export function registerWorkflowRoutes(app: Hono, deps: ServerProviderDeps, logg
     return c.json(response, response.success ? 200 : 500);
   });
 
+  app.get(WORKFLOW_ROUTES.listWorkflowRuns.path, async (c) => {
+    const query = c.req.query();
+    const response = await handleListWorkflowRuns(undefined, query, deps, logger);
+    const status = response.success ? 200 : response.error?.includes("not found") ? 404 : 500;
+    return c.json(response, status);
+  });
+
   app.get(WORKFLOW_ROUTES.getWorkflowState.path, async (c) => {
     const workflowId = c.req.param("id");
     const executionId = c.req.param("executionId");
     const response = await handleGetWorkflowState(workflowId, executionId, deps, logger);
     const status = response.success ? 200 : response.error?.includes("not found") ? 404 : 500;
+    return c.json(response, status);
+  });
+}
+
+export function registerToolRoutes(app: Hono, deps: ServerProviderDeps, logger: Logger) {
+  app.get(TOOL_ROUTES.listTools.path, async (c) => {
+    const response = await handleListTools(deps, logger);
+    const status = response.success ? 200 : response.httpStatus || 500;
+    return c.json(response, status);
+  });
+
+  app.post(TOOL_ROUTES.executeTool.path, async (c) => {
+    const toolName = c.req.param("name");
+    const body = await readJsonBody(c, logger);
+    if (!body) {
+      return c.json({ success: false, error: "Invalid JSON body" }, 400);
+    }
+
+    const response = await handleExecuteTool(toolName, body, deps, logger);
+    const status = response.success ? 200 : response.httpStatus || 500;
     return c.json(response, status);
   });
 }
@@ -463,6 +514,53 @@ export function registerObservabilityRoutes(app: Hono, deps: ServerProviderDeps,
     }
 
     return c.json(result, 200);
+  });
+}
+
+export function registerTriggerRoutes(app: Hono, deps: ServerProviderDeps, logger: Logger) {
+  const triggers = deps.triggerRegistry.list();
+  triggers.forEach((trigger) => {
+    const method = trigger.method ?? "post";
+    const handler = async (c: any) => {
+      const body = await readJsonBody<unknown>(c, logger);
+      const queryParams = c.req.query();
+      const context: TriggerHttpRequestContext = {
+        body,
+        headers: extractHeaders(c.req.raw?.headers ?? new Headers()),
+        query:
+          queryParams && typeof queryParams === "object"
+            ? { ...queryParams }
+            : ({} as Record<string, string>),
+        raw: c.req.raw,
+      };
+
+      const response = await executeTriggerHandler(trigger, context, deps, logger);
+
+      // Ensure spans are flushed (using waitUntil if available)
+      // This is critical for serverless environments to avoid orphan spans
+      const observability = deps.observability as any;
+      if (observability?.flushOnFinish) {
+        await observability.flushOnFinish();
+      } else if (observability?.forceFlush) {
+        await observability.forceFlush();
+      }
+
+      return c.json(response.body ?? { success: true }, response.status, response.headers);
+    };
+
+    if (typeof (app as any)[method] !== "function") {
+      logger.warn(
+        `Skipping trigger ${trigger.name}: method ${method} is not supported in the serverless adapter`,
+      );
+      return;
+    }
+
+    (app as any)[method](trigger.path, handler);
+    logger.info("[volt] Trigger route registered", {
+      trigger: trigger.name,
+      method: method.toUpperCase(),
+      path: trigger.path,
+    });
   });
 }
 

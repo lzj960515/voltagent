@@ -17,6 +17,9 @@ You can build production-ready agents with memory, workflows, tools, and built-i
 
 VoltAgent provides a complete platform for developing and monitoring AI agents through two complementary tools.
 
+For end-to-end walkthroughs (e.g., Slack agent), see the [Recipes & Guides](/recipes-and-guides/) section.
+Need a frontend? Check the [UI integration guides](/docs/ui/overview/) for ready-made chat UIs (AI SDK, CopilotKit, Assistant UI) backed by VoltAgent.
+
 ### Core Framework
 
 With the core framework, you can build intelligent agents with memory, tools, and multi-step workflows while connecting to any AI provider. Create sophisticated multi-agent systems where specialized agents work together under supervisor coordination.
@@ -68,7 +71,13 @@ description: 'Plug in retriever agents to pull facts from your data sources and 
 },
 {
 type: 'link',
-href: '/docs/evals/overview/',
+href: '/docs/rag/voltagent/',
+label: 'VoltAgent Knowledge Base',
+description: 'Use the managed RAG service for document ingestion, chunking, embeddings, and semantic search.'
+},
+{
+type: 'link',
+href: '/evaluation-docs/',
 label: 'Evals',
 description: 'Ship guardrails faster by running agent eval suites alongside your workflows.'
 },
@@ -77,6 +86,12 @@ type: 'link',
 href: '/docs/guardrails/overview/',
 label: 'Guardrails',
 description: 'Add safety checks and validation layers to ensure your agents behave correctly and safely.'
+},
+{
+type: 'link',
+href: '/deployment-docs/voltops/',
+label: 'Deployment',
+description: 'Deploy your agents to production with one-click GitHub integration and managed infrastructure.'
 }
 ]} />
 
@@ -167,7 +182,7 @@ const voltops = createVoltOpsClient({
 });
 
 await voltops.actions.airtable.createRecord({
-  credentialId: "cred_abc123",
+  credential: { credentialId: "cred_abc123" },
   baseId: "appXXXXXXXXXXXXXX",
   tableId: "tblYYYYYYYYYYYY",
   fields: {
@@ -182,6 +197,6 @@ Bindings run inside VoltOps with observability, retries, and can be attached to 
 
 ### VoltOps LLM Observability Platform
 
-VoltAgent comes with built-in [VoltOps](/voltops-llm-observability-docs/) LLM observability to monitor and debug your agents in real-time with detailed execution traces, performance metrics, and visual dashboards. Inspect every decision your agents make, track tool usage, and optimize your workflows with built-in OpenTelemetry-based observability.
+VoltAgent comes with built-in [VoltOps](/observability-docs/) LLM observability to monitor and debug your agents in real-time with detailed execution traces, performance metrics, and visual dashboards. Inspect every decision your agents make, track tool usage, and optimize your workflows with built-in OpenTelemetry-based observability.
 
 ![VoltOps LLM Observability Platform](https://cdn.voltagent.dev/readme/demo.gif)

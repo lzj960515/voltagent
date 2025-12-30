@@ -6,6 +6,7 @@ import {
   type CreateConversationInput,
   type GetConversationStepsOptions,
   type GetMessagesOptions,
+  type OperationContext,
   type SearchResult,
   type StorageAdapter,
   type VectorAdapter,
@@ -169,14 +170,24 @@ export class ManagedMemoryAdapter implements StorageAdapter {
     }
   }
 
-  addMessage(message: UIMessage, userId: string, conversationId: string): Promise<void> {
+  addMessage(
+    message: UIMessage,
+    userId: string,
+    conversationId: string,
+    _context?: OperationContext,
+  ): Promise<void> {
     return this.withClientContext(async ({ client, database }) => {
       this.log("Executing managed memory addMessage", safeStringify({ userId, conversationId }));
       await client.managedMemory.messages.add(database.id, { message, userId, conversationId });
     }).then(() => undefined);
   }
 
-  addMessages(messages: UIMessage[], userId: string, conversationId: string): Promise<void> {
+  addMessages(
+    messages: UIMessage[],
+    userId: string,
+    conversationId: string,
+    _context?: OperationContext,
+  ): Promise<void> {
     return this.withClientContext(async ({ client, database }) => {
       this.log(
         "Executing managed memory addMessages",
@@ -194,13 +205,19 @@ export class ManagedMemoryAdapter implements StorageAdapter {
     userId: string,
     conversationId: string,
     options?: GetMessagesOptions,
-  ): Promise<UIMessage[]> {
-    return this.withClientContext(({ client, database }) => {
+    _context?: OperationContext,
+  ): Promise<UIMessage<{ createdAt: Date }>[]> {
+    return this.withClientContext(async ({ client, database }) => {
       this.log(
         "Fetching managed memory messages",
         safeStringify({ userId, conversationId, options }),
       );
-      return client.managedMemory.messages.list(database.id, { userId, conversationId, options });
+      const messages = await client.managedMemory.messages.list(database.id, {
+        userId,
+        conversationId,
+        options,
+      });
+      return messages as UIMessage<{ createdAt: Date }>[];
     });
   }
 
@@ -232,7 +249,11 @@ export class ManagedMemoryAdapter implements StorageAdapter {
     });
   }
 
-  clearMessages(userId: string, conversationId?: string): Promise<void> {
+  clearMessages(
+    userId: string,
+    conversationId?: string,
+    _context?: OperationContext,
+  ): Promise<void> {
     return this.withClientContext(async ({ client, database }) => {
       this.log("Clearing managed memory messages", safeStringify({ userId, conversationId }));
       await client.managedMemory.messages.clear(database.id, { userId, conversationId });
@@ -338,6 +359,20 @@ export class ManagedMemoryAdapter implements StorageAdapter {
     return this.withClientContext(({ client, database }) => {
       this.log("Fetching managed memory workflow state", safeStringify({ executionId }));
       return client.managedMemory.workflowStates.get(database.id, executionId);
+    });
+  }
+
+  queryWorkflowRuns(query: {
+    workflowId?: string;
+    status?: WorkflowStateEntry["status"];
+    from?: Date;
+    to?: Date;
+    limit?: number;
+    offset?: number;
+  }): Promise<WorkflowStateEntry[]> {
+    return this.withClientContext(({ client, database }) => {
+      this.log("Querying managed memory workflow states", safeStringify(query));
+      return client.managedMemory.workflowStates.query(database.id, query);
     });
   }
 

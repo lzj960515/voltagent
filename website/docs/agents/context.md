@@ -78,10 +78,79 @@ executionContext.set("language", "English");
 const response = await agent.generateText("Hello!", {
   context: executionContext,
 });
-
 // Now you can access the data from the response
 console.log("Language:", response.context?.get("language"));
 ```
+
+## Sending User Information
+
+You can pass user information to the agent using the `context`. This information is automatically picked up by the tracing system and associated with the trace.
+
+Supported fields:
+
+- `user.name`: User's full name
+- `user.email`: User's email address
+- `user.avatar`: User's avatar URL (optional, falls back to Gravatar using email if not provided)
+- `user.metadata`: Additional metadata object
+
+<Tabs>
+  <TabItem value="sdk" label="SDK" default>
+
+When using the SDK, pass user information in the `context` Map:
+
+```typescript
+import { Agent } from "@voltagent/core";
+
+const agent = new Agent({ ... });
+
+const context = new Map();
+context.set("user.name", "John Doe");
+context.set("user.email", "john@example.com");
+context.set("user.avatar", "https://example.com/avatar.jpg");
+context.set("user.metadata", { plan: "pro" });
+
+await agent.generateText("Hello", { userId: "user_123", context });
+```
+
+  </TabItem>
+  <TabItem value="api" label="REST API">
+
+When using the REST API, you can pass user information in the `context` object. You can use either a nested `user` object or flat keys.
+
+**Option 1: Nested User Object**
+
+```json
+{
+  "prompt": "Hello",
+  "userId": "user_123",
+  "context": {
+    "user": {
+      "name": "John Doe",
+      "email": "john@example.com",
+      "avatar": "https://example.com/avatar.jpg",
+      "metadata": { "plan": "pro" }
+    }
+  }
+}
+```
+
+**Option 2: Flat Keys**
+
+```json
+{
+  "prompt": "Hello",
+  "userId": "user_123",
+  "context": {
+    "user.name": "John Doe",
+    "user.email": "john@example.com",
+    "user.avatar": "https://example.com/avatar.jpg",
+    "user.metadata": { "plan": "pro" }
+  }
+}
+```
+
+  </TabItem>
+</Tabs>
 
 ## Hooks Access context
 

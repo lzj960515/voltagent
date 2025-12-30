@@ -76,8 +76,21 @@ export class InMemoryStorageAdapter implements StorageAdapter {
       conversationId,
     };
 
+    const conversationMessages = this.storage[userId][conversationId];
+    const existingIndex = conversationMessages.findIndex((msg) => msg.id === message.id);
+
+    if (existingIndex >= 0) {
+      const existing = conversationMessages[existingIndex];
+      conversationMessages[existingIndex] = {
+        ...existing,
+        ...storedMessage,
+        createdAt: existing.createdAt,
+      };
+      return;
+    }
+
     // Add message to storage
-    this.storage[userId][conversationId].push(storedMessage);
+    conversationMessages.push(storedMessage);
   }
 
   /**
@@ -102,7 +115,7 @@ export class InMemoryStorageAdapter implements StorageAdapter {
     conversationId: string,
     options?: GetMessagesOptions,
     _context?: OperationContext,
-  ): Promise<UIMessage[]> {
+  ): Promise<UIMessage<{ createdAt: Date }>[]> {
     const { limit = 100, before, after, roles } = options || {};
 
     // Get user's messages or return empty array
@@ -135,8 +148,17 @@ export class InMemoryStorageAdapter implements StorageAdapter {
     return messages.map((msg) => {
       const cloned = deepClone(msg);
       // Remove storage-specific fields to return clean UIMessage
-      const { createdAt, userId: msgUserId, conversationId: msgConvId, ...uiMessage } = cloned;
-      return uiMessage as UIMessage;
+      const { userId: msgUserId, conversationId: msgConvId, ...uiMessage } = cloned;
+
+      // Ensure metadata exists
+      if (!uiMessage.metadata) {
+        uiMessage.metadata = {};
+      }
+
+      // Add createdAt to metadata
+      (uiMessage.metadata as any).createdAt = cloned.createdAt;
+
+      return uiMessage as UIMessage<{ createdAt: Date }>;
     });
   }
 
@@ -454,6 +476,56 @@ export class InMemoryStorageAdapter implements StorageAdapter {
   async getWorkflowState(executionId: string): Promise<WorkflowStateEntry | null> {
     const state = this.workflowStates.get(executionId);
     return state ? deepClone(state) : null;
+  }
+
+  /**
+   * Query workflow states with optional filters
+   */
+  async queryWorkflowRuns(query: {
+    workflowId?: string;
+    status?: WorkflowStateEntry["status"];
+    from?: Date;
+    to?: Date;
+    limit?: number;
+    offset?: number;
+  }): Promise<WorkflowStateEntry[]> {
+    const states: WorkflowStateEntry[] = [];
+
+    if (query.workflowId) {
+      const executionIds = this.workflowStatesByWorkflow.get(query.workflowId);
+      if (executionIds) {
+        for (const id of executionIds) {
+          const state = this.workflowStates.get(id);
+          if (state) {
+            states.push(deepClone(state));
+          }
+        }
+      }
+    } else {
+      for (const state of this.workflowStates.values()) {
+        states.push(deepClone(state));
+      }
+    }
+
+    const filtered = states
+      .filter((state) => {
+        if (query.status && state.status !== query.status) {
+          return false;
+        }
+        if (query.from && state.createdAt < query.from) {
+          return false;
+        }
+        if (query.to && state.createdAt > query.to) {
+          return false;
+        }
+        return true;
+      })
+      .sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
+
+    const start = query.offset ?? 0;
+    const end = query.limit ? start + query.limit : undefined;
+
+    return filtered.slice(start, end);
   }
 
   /**
