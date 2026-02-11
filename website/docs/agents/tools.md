@@ -46,6 +46,91 @@ Each tool has:
 
 The `execute` function's parameter types are automatically inferred from the Zod schema, providing full IntelliSense support.
 
+## Tool Hooks
+
+You can attach tool-specific hooks to observe or post-process a tool result. Tool hooks run before agent-level hooks, and agent `onToolEnd` can still override the output afterward.
+
+**Hook parameters:**
+
+- `onStart`: `{ tool, args, options }`
+- `onEnd`: `{ tool, args, output, error, options }` (return `{ output }` to override the result)
+
+> Overrides are re-validated if the tool has an `outputSchema`. For streaming tools (AsyncIterable), overrides apply only to the final output.
+
+```ts
+import { createTool } from "@voltagent/core";
+import { z } from "zod";
+
+const summarizeTool = createTool({
+  name: "summarize_text",
+  description: "Summarize text with a hard cap",
+  parameters: z.object({ text: z.string() }),
+  execute: async ({ text }) => text,
+  hooks: {
+    onStart: ({ tool }) => {
+      console.log(`[tool] ${tool.name} starting`);
+    },
+    onEnd: ({ output }) => {
+      if (typeof output === "string") {
+        return { output: output.slice(0, 500) };
+      }
+    },
+  },
+});
+```
+
+## Streaming Tool Results (Preliminary)
+
+If your tool can provide progress or intermediate status, return an `AsyncIterable` from `execute`.
+Each `yield` is emitted as a preliminary tool result, and the **last yielded value** is treated as the final result.
+
+```ts
+import { createTool } from "@voltagent/core";
+import { z } from "zod";
+
+const weatherOutputSchema = z.discriminatedUnion("status", [
+  z.object({
+    status: z.literal("loading"),
+    text: z.string(),
+    weather: z.undefined().optional(),
+  }),
+  z.object({
+    status: z.literal("success"),
+    text: z.string(),
+    weather: z.object({
+      location: z.string(),
+      temperature: z.number(),
+    }),
+  }),
+]);
+
+const weatherTool = createTool({
+  name: "get_weather",
+  description: "Get the current weather for a location",
+  parameters: z.object({
+    location: z.string().describe("The city name"),
+  }),
+  outputSchema: weatherOutputSchema,
+  async *execute({ location }) {
+    yield {
+      status: "loading" as const,
+      text: `Getting weather for ${location}`,
+      weather: undefined,
+    };
+
+    await new Promise((resolve) => setTimeout(resolve, 3000));
+
+    const temperature = 72 + Math.floor(Math.random() * 21) - 10;
+
+    yield {
+      status: "success" as const,
+      text: `The weather in ${location} is ${temperature}F`,
+      weather: { location, temperature },
+    };
+  },
+});
+```
+
 ### Tool Tags
 
 Tags are optional string labels that help organize and categorize tools.
@@ -139,12 +224,11 @@ Add tools when creating an agent. The model decides when to use them based on th
 
 ```ts
 import { Agent } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 const agent = new Agent({
   name: "Weather Assistant",
   instructions: "An assistant that provides weather information",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   tools: [weatherTool],
 });
 
@@ -175,7 +259,7 @@ const calculatorTool = createTool({
 const agent = new Agent({
   name: "Multi-Tool Assistant",
   instructions: "An assistant that can check weather and perform calculations",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   tools: [weatherTool, calculatorTool],
 });
 
@@ -604,13 +688,12 @@ function ReadClipboardTool({
 
 **Important**: You must call `addToolResult` to send the tool result back to the model. Without this, the model considers the tool call a failure.
 
-## Tool Hooks
+## Agent Tool Hooks
 
-Hooks let you respond to tool execution events for logging, UI updates, or additional actions.
+Hooks let you respond to tool execution events for logging, UI updates, or additional actions. For tool-level hooks (per tool), see the **Tool Hooks** section above.
 
 ```ts
 import { Agent, createHooks, isAbortError } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 const hooks = createHooks({
   onToolStart({ agent, tool, context, args }) {
@@ -638,7 +721,7 @@ const hooks = createHooks({
 const agent = new Agent({
   name: "Assistant with Tool Hooks",
   instructions: "An assistant that logs tool execution",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   tools: [weatherTool],
   hooks: hooks,
 });
@@ -675,7 +758,7 @@ const hooks = createHooks({
 const agent = new Agent({
   name: "Controlled Assistant",
   instructions: "An assistant with tag-based access control",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   tools: [queryTool, updateTool, weatherTool],
   hooks: hooks,
 });
@@ -941,7 +1024,6 @@ Connect to MCP servers and use their tools with your agents:
 
 ```ts
 import { Agent, MCPConfiguration } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 // Configure MCP servers
 const mcpConfig = new MCPConfiguration({
@@ -971,7 +1053,7 @@ const allMcpTools = await mcpConfig.getTools();
 const agent = new Agent({
   name: "MCP-Enhanced Assistant",
   description: "Assistant with MCP tools",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   tools: allMcpTools,
 });
 ```

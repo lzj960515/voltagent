@@ -11,6 +11,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { z } from "zod";
 import { Memory } from "../memory";
 import { InMemoryStorageAdapter } from "../memory/adapters/storage/in-memory";
+import { AgentRegistry } from "../registries/agent-registry";
+import { ModelProviderRegistry } from "../registries/model-provider-registry";
 import { Tool } from "../tool";
 import { Agent, renameProviderOptions } from "./agent";
 import { ConversationBuffer } from "./conversation-buffer";
@@ -166,6 +168,54 @@ describe("Agent", () => {
       }
 
       expect(result.text).toBe("Generated response");
+    });
+
+    it("should resolve string model ids via registry", async () => {
+      const registry = ModelProviderRegistry.getInstance();
+      registry.registerProvider("mock", (modelId) => {
+        expect(modelId).toBe("test-model");
+        return mockModel as any;
+      });
+
+      const agent = new Agent({
+        name: "TestAgent",
+        instructions: "You are a helpful assistant",
+        model: "mock/test-model",
+      });
+
+      const mockResponse = {
+        text: "Generated response",
+        content: [{ type: "text", text: "Generated response" }],
+        reasoning: [],
+        files: [],
+        sources: [],
+        toolCalls: [],
+        toolResults: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          totalTokens: 15,
+        },
+        warnings: [],
+        request: {},
+        response: {
+          id: "test-response",
+          modelId: "test-model",
+          timestamp: new Date(),
+          messages: [],
+        },
+        steps: [],
+      };
+
+      vi.mocked(ai.generateText).mockResolvedValue(mockResponse as any);
+
+      await agent.generateText("Hello, world!");
+
+      const callArgs = vi.mocked(ai.generateText).mock.calls[0][0];
+      expect(callArgs.model).toBe(mockModel);
+
+      registry.unregisterProvider("mock");
     });
 
     it("should generate text from UIMessage array", async () => {
@@ -617,6 +667,147 @@ describe("Agent", () => {
       const text = await result.text;
       expect(text).toBe("Streamed response");
     });
+
+    it("pre-creates streaming message ids and forwards them to UI streams", async () => {
+      const agent = new Agent({
+        name: "TestAgent",
+        instructions: "You are a helpful assistant",
+        model: mockModel as any,
+      });
+
+      const mockStream = {
+        text: Promise.resolve("Streamed response"),
+        textStream: (async function* () {
+          yield "Streamed response";
+        })(),
+        fullStream: (async function* () {
+          yield {
+            type: "start" as const,
+          };
+          yield {
+            type: "text-delta" as const,
+            id: "text-1",
+            delta: "Streamed response",
+            text: "Streamed response",
+          };
+        })(),
+        usage: Promise.resolve({
+          inputTokens: 10,
+          outputTokens: 5,
+          totalTokens: 15,
+        }),
+        finishReason: Promise.resolve("stop"),
+        warnings: [],
+        toUIMessageStream: vi.fn().mockReturnValue((async function* () {})()),
+        toUIMessageStreamResponse: vi.fn(),
+        pipeUIMessageStreamToResponse: vi.fn(),
+        pipeTextStreamToResponse: vi.fn(),
+        toTextStreamResponse: vi.fn(),
+        partialOutputStream: undefined,
+      };
+
+      const memoryManager = agent.getMemoryManager();
+      const saveMessageSpy = vi.spyOn(memoryManager, "saveMessage");
+
+      vi.mocked(ai.streamText).mockReturnValue(mockStream as any);
+
+      const result = await agent.streamText("Stream this", {
+        userId: "user-1",
+        conversationId: "conv-1",
+      });
+
+      const placeholderSaved = saveMessageSpy.mock.calls
+        .map((call) => call[1] as UIMessage)
+        .some((message) => message.role === "assistant" && message.parts.length === 0);
+
+      expect(placeholderSaved).toBe(false);
+
+      result.toUIMessageStream();
+
+      const callArgs = mockStream.toUIMessageStream.mock.calls[0]?.[0];
+      expect(callArgs).toEqual(
+        expect.objectContaining({
+          generateMessageId: expect.any(Function),
+        }),
+      );
+      const generatedId = callArgs?.generateMessageId();
+      expect(typeof generatedId).toBe("string");
+      expect(generatedId).not.toBe("");
+      expect(callArgs?.generateMessageId()).toBe(generatedId);
+
+      const parts: any[] = [];
+      for await (const part of result.fullStream) {
+        parts.push(part);
+      }
+      expect(parts).toHaveLength(2);
+      expect(parts[0]).toEqual(expect.objectContaining({ type: "start", messageId: generatedId }));
+      expect(parts[1]).toEqual(expect.objectContaining({ type: "text-delta", id: "text-1" }));
+    });
+
+    it("uses last-step usage for finish events when provider is anthropic", async () => {
+      const agent = new Agent({
+        name: "TestAgent",
+        instructions: "You are a helpful assistant",
+        model: mockModel as any,
+      });
+
+      const lastStepUsage = {
+        inputTokens: 10,
+        outputTokens: 5,
+        totalTokens: 15,
+        raw: {
+          cache_creation_input_tokens: 10,
+        },
+      };
+      const summedUsage = {
+        inputTokens: 25,
+        outputTokens: 10,
+        totalTokens: 35,
+      };
+
+      const mockStream = {
+        text: Promise.resolve("Streamed response"),
+        textStream: (async function* () {
+          yield "Streamed response";
+        })(),
+        fullStream: (async function* () {
+          yield {
+            type: "finish-step" as const,
+            usage: lastStepUsage,
+            finishReason: "stop",
+            rawFinishReason: "stop",
+            providerMetadata: { anthropic: {} },
+            response: {},
+          };
+          yield {
+            type: "finish" as const,
+            finishReason: "stop",
+            rawFinishReason: "stop",
+            totalUsage: summedUsage,
+          };
+        })(),
+        usage: Promise.resolve(lastStepUsage),
+        finishReason: Promise.resolve("stop"),
+        warnings: [],
+        toUIMessageStream: vi.fn(),
+        toUIMessageStreamResponse: vi.fn(),
+        pipeUIMessageStreamToResponse: vi.fn(),
+        pipeTextStreamToResponse: vi.fn(),
+        toTextStreamResponse: vi.fn(),
+        partialOutputStream: undefined,
+      };
+
+      vi.mocked(ai.streamText).mockReturnValue(mockStream as any);
+
+      const result = await agent.streamText("Stream this");
+      const parts: any[] = [];
+      for await (const part of result.fullStream) {
+        parts.push(part);
+      }
+
+      const finishPart = parts.find((part) => part.type === "finish");
+      expect(finishPart?.totalUsage).toEqual(lastStepUsage);
+    });
   });
 
   describe("Tool Management", () => {
@@ -774,6 +965,98 @@ describe("Agent", () => {
         toolName: "circular-tool",
       });
       expect(typeof result.config).toBe("string");
+
+      operationContext.traceContext.end("completed");
+    });
+
+    it("allows onToolEnd to override tool output", async () => {
+      const onToolEnd = vi.fn().mockResolvedValue({ output: "trimmed" });
+      const agent = new Agent({
+        name: "TestAgent",
+        instructions: "Test",
+        model: mockModel as any,
+        hooks: createHooks({ onToolEnd }),
+      });
+
+      const tool = new Tool({
+        name: "text-tool",
+        description: "Returns text",
+        parameters: z.object({}),
+        execute: async () => "original",
+      });
+
+      const operationContext = (agent as any).createOperationContext("input");
+      const executeFactory = (agent as any).createToolExecutionFactory(
+        operationContext,
+        agent.hooks,
+      );
+
+      const execute = executeFactory(tool);
+      const result = await execute({});
+
+      expect(result).toBe("trimmed");
+      expect(onToolEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tool,
+          output: "original",
+          error: undefined,
+        }),
+      );
+
+      operationContext.traceContext.end("completed");
+    });
+
+    it("supports tool-level hooks for start and end", async () => {
+      const toolOnStart = vi.fn();
+      const toolOnEnd = vi.fn().mockResolvedValue({ output: "tool-hook" });
+      const onToolEnd = vi.fn().mockResolvedValue({ output: "agent-hook" });
+      const agent = new Agent({
+        name: "TestAgent",
+        instructions: "Test",
+        model: mockModel as any,
+        hooks: createHooks({ onToolEnd }),
+      });
+
+      const tool = new Tool({
+        name: "hooked-tool",
+        description: "Returns text",
+        parameters: z.object({}),
+        execute: async () => "original",
+        hooks: {
+          onStart: toolOnStart,
+          onEnd: toolOnEnd,
+        },
+      });
+
+      const operationContext = (agent as any).createOperationContext("input");
+      const executeFactory = (agent as any).createToolExecutionFactory(
+        operationContext,
+        agent.hooks,
+      );
+
+      const execute = executeFactory(tool);
+      const result = await execute({});
+
+      expect(result).toBe("agent-hook");
+      expect(toolOnStart).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tool,
+        }),
+      );
+      expect(toolOnEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tool,
+          output: "original",
+          error: undefined,
+        }),
+      );
+      expect(onToolEnd).toHaveBeenCalledWith(
+        expect.objectContaining({
+          tool,
+          output: "tool-hook",
+          error: undefined,
+        }),
+      );
 
       operationContext.traceContext.end("completed");
     });
@@ -1129,6 +1412,71 @@ describe("Agent", () => {
     });
   });
 
+  describe("Global Memory Defaults", () => {
+    beforeEach(() => {
+      const registry = AgentRegistry.getInstance();
+      registry.setGlobalAgentMemory(undefined);
+      registry.setGlobalWorkflowMemory(undefined);
+      registry.setGlobalMemory(undefined);
+    });
+
+    afterEach(() => {
+      const registry = AgentRegistry.getInstance();
+      registry.setGlobalAgentMemory(undefined);
+      registry.setGlobalWorkflowMemory(undefined);
+      registry.setGlobalMemory(undefined);
+    });
+
+    it("should use global agent memory when not configured", () => {
+      const registry = AgentRegistry.getInstance();
+      const globalMemory = new Memory({
+        storage: new InMemoryStorageAdapter(),
+      });
+      registry.setGlobalAgentMemory(globalMemory);
+
+      const agent = new Agent({
+        name: "DefaultMemoryAgent",
+        instructions: "Test",
+        model: mockModel as any,
+      });
+
+      expect(agent.getMemory()).toBe(globalMemory);
+    });
+
+    it("should fall back to global memory when agent memory is not set", () => {
+      const registry = AgentRegistry.getInstance();
+      const globalMemory = new Memory({
+        storage: new InMemoryStorageAdapter(),
+      });
+      registry.setGlobalMemory(globalMemory);
+
+      const agent = new Agent({
+        name: "FallbackMemoryAgent",
+        instructions: "Test",
+        model: mockModel as any,
+      });
+
+      expect(agent.getMemory()).toBe(globalMemory);
+    });
+
+    it("should not override explicit memory disabled", () => {
+      const registry = AgentRegistry.getInstance();
+      const globalMemory = new Memory({
+        storage: new InMemoryStorageAdapter(),
+      });
+      registry.setGlobalAgentMemory(globalMemory);
+
+      const agent = new Agent({
+        name: "StatelessAgent",
+        instructions: "Test",
+        model: mockModel as any,
+        memory: false,
+      });
+
+      expect(agent.getMemory()).toBe(false);
+    });
+  });
+
   describe("Hook System", () => {
     it("should call onStart hook with proper context", async () => {
       const onStart = vi.fn();
@@ -1475,7 +1823,291 @@ describe("Agent", () => {
     });
   });
 
+  describe("Middleware", () => {
+    it("runs input middleware before input guardrails", async () => {
+      const inputMiddleware = ({ input }: { input: string | UIMessage[] }) => {
+        if (typeof input === "string") {
+          return `${input}-middleware`;
+        }
+        return input;
+      };
+
+      const inputGuardrail = ({ input }: { input: string | UIMessage[] }) => {
+        if (input !== "hello-middleware") {
+          throw new Error("Guardrail saw unexpected input");
+        }
+        return { pass: true };
+      };
+
+      const agent = new Agent({
+        name: "MiddlewareAgent",
+        instructions: "Test",
+        model: mockModel as any,
+        inputMiddlewares: [inputMiddleware],
+        inputGuardrails: [inputGuardrail as any],
+      });
+
+      vi.mocked(ai.generateText).mockResolvedValue({
+        text: "ok",
+        content: [{ type: "text", text: "ok" }],
+        reasoning: [],
+        files: [],
+        sources: [],
+        toolCalls: [],
+        toolResults: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+        },
+        warnings: [],
+        request: {},
+        response: {
+          id: "test-response",
+          modelId: "test-model",
+          timestamp: new Date(),
+          messages: [],
+        },
+        steps: [],
+      } as any);
+
+      const result = await agent.generateText("hello");
+      expect(result.text).toBe("ok");
+    });
+
+    it("runs output middleware before output guardrails", async () => {
+      const outputMiddleware = ({ output }: { output: string }) => `${output}-middleware`;
+      const outputGuardrail = ({ output }: { output: string }) => {
+        if (output !== "base-middleware") {
+          throw new Error("Guardrail saw unexpected output");
+        }
+        return { pass: true };
+      };
+
+      const agent = new Agent({
+        name: "MiddlewareAgent",
+        instructions: "Test",
+        model: mockModel as any,
+        outputMiddlewares: [outputMiddleware],
+        outputGuardrails: [outputGuardrail as any],
+      });
+
+      vi.mocked(ai.generateText).mockResolvedValue({
+        text: "base",
+        content: [{ type: "text", text: "base" }],
+        reasoning: [],
+        files: [],
+        sources: [],
+        toolCalls: [],
+        toolResults: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+        },
+        warnings: [],
+        request: {},
+        response: {
+          id: "test-response",
+          modelId: "test-model",
+          timestamp: new Date(),
+          messages: [],
+        },
+        steps: [],
+      } as any);
+
+      const result = await agent.generateText("hello");
+      expect(result.text).toBe("base-middleware");
+    });
+
+    it("retries when middleware requests retry", async () => {
+      const outputMiddleware = ({
+        output,
+        retryCount,
+        abort,
+      }: {
+        output: string;
+        retryCount: number;
+        abort: (reason?: string, options?: { retry?: boolean }) => never;
+      }) => {
+        if (retryCount === 0) {
+          abort("retry", { retry: true });
+        }
+        return `${output}-ok`;
+      };
+
+      const agent = new Agent({
+        name: "MiddlewareRetryAgent",
+        instructions: "Test",
+        model: mockModel as any,
+        outputMiddlewares: [outputMiddleware],
+        maxMiddlewareRetries: 1,
+      });
+
+      vi.mocked(ai.generateText).mockResolvedValue({
+        text: "base",
+        content: [{ type: "text", text: "base" }],
+        reasoning: [],
+        files: [],
+        sources: [],
+        toolCalls: [],
+        toolResults: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 1,
+          outputTokens: 1,
+          totalTokens: 2,
+        },
+        warnings: [],
+        request: {},
+        response: {
+          id: "test-response",
+          modelId: "test-model",
+          timestamp: new Date(),
+          messages: [],
+        },
+        steps: [],
+      } as any);
+
+      const result = await agent.generateText("hello");
+      expect(result.text).toBe("base-ok");
+      expect(vi.mocked(ai.generateText)).toHaveBeenCalledTimes(2);
+    });
+  });
+
   describe("Error Handling", () => {
+    it("should fall back to the next model when the primary fails", async () => {
+      const fallbackModel = new MockLanguageModelV3({
+        modelId: "fallback-model",
+        doGenerate: {
+          content: [{ type: "text", text: "Fallback response" }],
+          finishReason: "stop",
+          usage: {
+            inputTokens: 10,
+            outputTokens: 5,
+            totalTokens: 15,
+            inputTokenDetails: {
+              noCacheTokens: 10,
+              cacheReadTokens: 0,
+              cacheWriteTokens: 0,
+            },
+            outputTokenDetails: {
+              textTokens: 5,
+              reasoningTokens: 0,
+            },
+          },
+          warnings: [],
+        },
+      });
+
+      const agent = new Agent({
+        name: "TestAgent",
+        instructions: "Test",
+        model: [
+          { model: mockModel as any, maxRetries: 0 },
+          { model: fallbackModel as any, maxRetries: 1 },
+        ],
+      });
+
+      const mockResponse = {
+        text: "Fallback response",
+        content: [{ type: "text", text: "Fallback response" }],
+        reasoning: [],
+        files: [],
+        sources: [],
+        toolCalls: [],
+        toolResults: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          totalTokens: 15,
+        },
+        warnings: [],
+        request: {},
+        response: {
+          id: "test-response",
+          modelId: "fallback-model",
+          timestamp: new Date(),
+          messages: [],
+        },
+        steps: [],
+      };
+
+      vi.mocked(ai.generateText).mockImplementation(async (args: any) => {
+        if (args.model === mockModel) {
+          throw new Error("Primary model failed");
+        }
+        if (args.model === fallbackModel) {
+          return mockResponse as any;
+        }
+        throw new Error("Unexpected model");
+      });
+
+      const result = await agent.generateText("Test");
+
+      expect(result.text).toBe("Fallback response");
+      expect(vi.mocked(ai.generateText)).toHaveBeenCalledTimes(2);
+      expect(vi.mocked(ai.generateText).mock.calls[0][0].model).toBe(mockModel);
+      expect(vi.mocked(ai.generateText).mock.calls[1][0].model).toBe(fallbackModel);
+      expect(vi.mocked(ai.generateText).mock.calls[1][0].maxRetries).toBe(0);
+    });
+
+    it("should retry the same model before returning a response", async () => {
+      const agent = new Agent({
+        name: "RetryAgent",
+        instructions: "Test",
+        model: mockModel as any,
+        maxRetries: 2,
+      });
+
+      const mockResponse = {
+        text: "Retry response",
+        content: [{ type: "text", text: "Retry response" }],
+        reasoning: [],
+        files: [],
+        sources: [],
+        toolCalls: [],
+        toolResults: [],
+        finishReason: "stop",
+        usage: {
+          inputTokens: 10,
+          outputTokens: 5,
+          totalTokens: 15,
+        },
+        warnings: [],
+        request: {},
+        response: {
+          id: "retry-response",
+          modelId: "test-model",
+          timestamp: new Date(),
+          messages: [],
+        },
+        steps: [],
+      };
+
+      let callCount = 0;
+      vi.mocked(ai.generateText).mockImplementation(async () => {
+        callCount += 1;
+        if (callCount < 3) {
+          const error = new Error("Transient error");
+          (error as any).isRetryable = true;
+          throw error;
+        }
+        return mockResponse as any;
+      });
+
+      const result = await agent.generateText("Test");
+
+      expect(result.text).toBe("Retry response");
+      expect(vi.mocked(ai.generateText)).toHaveBeenCalledTimes(3);
+      for (const call of vi.mocked(ai.generateText).mock.calls) {
+        expect(call[0].maxRetries).toBe(0);
+      }
+    });
+
     it("should handle model errors gracefully", async () => {
       const agent = new Agent({
         name: "TestAgent",
@@ -1885,6 +2517,16 @@ describe("Agent", () => {
         name: "TestAgent",
         instructions: "Test",
         model: mockModel as any,
+      });
+
+      expect(agent.getModelName()).toBe("test-model");
+    });
+
+    it("should get model name from fallback list", () => {
+      const agent = new Agent({
+        name: "TestAgent",
+        instructions: "Test",
+        model: [{ model: mockModel as any }, { model: "mock/secondary" }],
       });
 
       expect(agent.getModelName()).toBe("test-model");

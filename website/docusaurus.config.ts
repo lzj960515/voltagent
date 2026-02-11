@@ -139,6 +139,18 @@ const config: Config = {
         sidebarCollapsed: false,
       },
     ],
+    // Models docs
+    [
+      "@docusaurus/plugin-content-docs",
+      {
+        id: "models",
+        path: "models-docs",
+        routeBasePath: "models-docs",
+        sidebarPath: "./sidebarsModels.ts",
+        breadcrumbs: false,
+        sidebarCollapsed: false,
+      },
+    ],
     // VoltAgent Recipes & Guides - Separate docs instance
     [
       "@docusaurus/plugin-content-docs",
@@ -452,10 +464,6 @@ const config: Config = {
             from: "/showcase/999-dev-ai-teammate/",
           },
           {
-            to: "/",
-            from: "/pricing/",
-          },
-          {
             to: "/recipes-and-guides/",
             from: "/recipes/",
           },
@@ -491,6 +499,18 @@ const config: Config = {
             to: "/docs/getting-started/providers-models/",
             from: "/docs/providers/contributing/",
           },
+          {
+            to: "/docs/agents/voltagent-instance/",
+            from: "/docs/getting-started/voltagent-instance/",
+          },
+          {
+            to: "/models-docs/",
+            from: "/docs/models/",
+          },
+          {
+            to: "/models-docs/providers/overview",
+            from: "/docs/models/providers/",
+          },
           // Redirect old /examples/ paths to /recipes-and-guides/
           {
             to: "/recipes-and-guides/",
@@ -520,6 +540,14 @@ const config: Config = {
             to: "/recipes-and-guides/chatgpt-app/",
             from: "/examples/agents/chatgpt-app/",
           },
+          {
+            to: "/docs/ai-assistants/",
+            from: "/docs/getting-started/mcp-docs-server/",
+          },
+          {
+            to: "/docs/ai-assistants/",
+            from: "/docs/skills/",
+          },
         ],
       },
     ],
@@ -541,7 +569,7 @@ const config: Config = {
       },
     ],
 
-    /* "./plugins/gurubase/index.js", */
+    "./plugins/gurubase/index.js",
     [
       "./plugins/docusaurus-plugin-content-mcp",
       {
@@ -574,7 +602,7 @@ const config: Config = {
     // ],
   ],
   themeConfig: {
-    image: "img/social3.png",
+    image: "img/social4.png",
     announcementBar: {
       id: "support_us",
       content:
@@ -603,6 +631,11 @@ const config: Config = {
           position: "left",
         },
         {
+          to: "/models-docs",
+          label: "Models",
+          position: "left",
+        },
+        {
           to: "/observability-docs",
           label: "Observability",
           position: "left",
@@ -625,6 +658,11 @@ const config: Config = {
         {
           to: "/mcp",
           label: "MCP",
+          position: "left",
+        },
+        {
+          to: "/pricing",
+          label: "Pricing",
           position: "left",
         },
       ],

@@ -3,7 +3,7 @@ import type { Logger } from "@voltagent/internal";
 import type { DangerouslyAllowAny } from "@voltagent/internal/types";
 import type { UIMessage } from "ai";
 import type { z } from "zod";
-import type { Agent, BaseGenerationOptions } from "../agent/agent";
+import type { Agent } from "../agent/agent";
 import { createWorkflow } from "./core";
 import type {
   InternalAnyWorkflowStep,
@@ -14,17 +14,35 @@ import type {
 } from "./internal/types";
 import {
   type WorkflowStep,
+  type WorkflowStepBranchConfig,
   type WorkflowStepConditionalWhenConfig,
+  type WorkflowStepForEachConfig,
+  type WorkflowStepGuardrailConfig,
+  type WorkflowStepLoopConfig,
+  type WorkflowStepMapConfig,
+  type WorkflowStepMapEntry,
+  type WorkflowStepMapResult,
   type WorkflowStepParallelAllConfig,
   type WorkflowStepParallelRaceConfig,
+  type WorkflowStepSleepConfig,
+  type WorkflowStepSleepUntilConfig,
   andAgent,
   andAll,
+  andBranch,
+  andDoUntil,
+  andDoWhile,
+  andForEach,
+  andGuardrail,
+  andMap,
   andRace,
+  andSleep,
+  andSleepUntil,
   andTap,
   andThen,
   andWhen,
   andWorkflow,
 } from "./steps";
+import type { AgentConfig, AgentOutputSchema, InferAgentOutput } from "./steps/and-agent";
 import type { InternalWorkflow } from "./steps/types";
 import type {
   Workflow,
@@ -32,28 +50,15 @@ import type {
   WorkflowExecutionResult,
   WorkflowInput,
   WorkflowRunOptions,
+  WorkflowStateStore,
+  WorkflowStateUpdater,
+  WorkflowStepData,
   WorkflowStepState,
   WorkflowStreamResult,
   WorkflowStreamWriter,
 } from "./types";
 
-/**
- * Agent configuration for the chain
- */
-export type AgentConfig<
-  SCHEMA extends z.ZodTypeAny,
-  INPUT_SCHEMA extends InternalBaseWorkflowInputSchema,
-  CURRENT_DATA,
-> = BaseGenerationOptions & {
-  schema:
-    | SCHEMA
-    | ((
-        context: Omit<
-          WorkflowExecuteContext<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA, any, any>,
-          "suspend" | "writer"
-        >,
-      ) => SCHEMA | Promise<SCHEMA>);
-};
+export type { AgentConfig } from "./steps/and-agent";
 
 /**
  * A workflow chain that provides a fluent API for building workflows
@@ -141,11 +146,12 @@ export class WorkflowChain<
    * ```
    *
    * @param task - The task (prompt) to execute for the agent, can be a string or a function that returns a string
-   * @param agent - The agent to execute the task using `generateObject`
-   * @param config - The config for the agent (schema) `generateObject` call
+   * @param agent - The agent to execute the task using `generateText`
+   * @param config - The config for the agent (schema) `generateText` call
+   * @param map - Optional mapper to shape or merge the agent output with existing data
    * @returns A workflow step that executes the agent with the task
    */
-  andAgent<SCHEMA extends z.ZodTypeAny>(
+  andAgent<SCHEMA extends AgentOutputSchema>(
     task:
       | string
       | UIMessage[]
@@ -158,18 +164,70 @@ export class WorkflowChain<
           any
         >,
     agent: Agent,
-    config: AgentConfig<SCHEMA, INPUT_SCHEMA, CURRENT_DATA>,
-  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, z.infer<SCHEMA>, SUSPEND_SCHEMA, RESUME_SCHEMA> {
-    const step = andAgent(task, agent, config) as unknown as WorkflowStep<
+    config: AgentConfig<SCHEMA, WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA>,
+  ): WorkflowChain<
+    INPUT_SCHEMA,
+    RESULT_SCHEMA,
+    InferAgentOutput<SCHEMA>,
+    SUSPEND_SCHEMA,
+    RESUME_SCHEMA
+  >;
+
+  andAgent<SCHEMA extends AgentOutputSchema, NEW_DATA>(
+    task:
+      | string
+      | UIMessage[]
+      | ModelMessage[]
+      | InternalWorkflowFunc<
+          WorkflowInput<INPUT_SCHEMA>,
+          CURRENT_DATA,
+          string | UIMessage[] | ModelMessage[],
+          any,
+          any
+        >,
+    agent: Agent,
+    config: AgentConfig<SCHEMA, WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA>,
+    map: (
+      output: InferAgentOutput<SCHEMA>,
+      context: WorkflowExecuteContext<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA, any, any>,
+    ) => Promise<NEW_DATA> | NEW_DATA,
+  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, NEW_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA>;
+
+  andAgent(
+    task:
+      | string
+      | UIMessage[]
+      | ModelMessage[]
+      | InternalWorkflowFunc<
+          WorkflowInput<INPUT_SCHEMA>,
+          CURRENT_DATA,
+          string | UIMessage[] | ModelMessage[],
+          any,
+          any
+        >,
+    agent: Agent,
+    config: AgentConfig<AgentOutputSchema, WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA>,
+    map?: (
+      output: unknown,
+      context: WorkflowExecuteContext<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA, any, any>,
+    ) => Promise<unknown> | unknown,
+  ): WorkflowChain<
+    INPUT_SCHEMA,
+    RESULT_SCHEMA,
+    DangerouslyAllowAny,
+    SUSPEND_SCHEMA,
+    RESUME_SCHEMA
+  > {
+    const step = andAgent(task, agent, config, map) as unknown as WorkflowStep<
       WorkflowInput<INPUT_SCHEMA>,
       CURRENT_DATA,
-      z.infer<SCHEMA> | DangerouslyAllowAny
+      DangerouslyAllowAny
     >;
     this.steps.push(step);
     return this as unknown as WorkflowChain<
       INPUT_SCHEMA,
       RESULT_SCHEMA,
-      z.infer<SCHEMA>,
+      DangerouslyAllowAny,
       SUSPEND_SCHEMA,
       RESUME_SCHEMA
     >;
@@ -193,18 +251,22 @@ export class WorkflowChain<
     execute: (context: {
       data: z.infer<IS>;
       state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-      getStepData: (stepId: string) => { input: any; output: any } | undefined;
+      workflowState: WorkflowStateStore;
+      setWorkflowState: (update: WorkflowStateUpdater) => void;
+      getStepData: (stepId: string) => WorkflowStepData | undefined;
       suspend: (
         reason?: string,
         suspendData?: SS extends z.ZodTypeAny ? z.infer<SS> : z.infer<SUSPEND_SCHEMA>,
       ) => Promise<never>;
       resumeData?: RS extends z.ZodTypeAny ? z.infer<RS> : z.infer<RESUME_SCHEMA>;
+      retryCount?: number;
       logger: Logger;
       writer: WorkflowStreamWriter;
     }) => Promise<z.infer<OS>>;
     id: string;
     name?: string;
     purpose?: string;
+    retries?: number;
   }): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, z.infer<OS>, SUSPEND_SCHEMA, RESUME_SCHEMA>;
 
   /**
@@ -225,18 +287,22 @@ export class WorkflowChain<
     execute: (context: {
       data: z.infer<IS>;
       state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-      getStepData: (stepId: string) => { input: any; output: any } | undefined;
+      workflowState: WorkflowStateStore;
+      setWorkflowState: (update: WorkflowStateUpdater) => void;
+      getStepData: (stepId: string) => WorkflowStepData | undefined;
       suspend: (
         reason?: string,
         suspendData?: SS extends z.ZodTypeAny ? z.infer<SS> : z.infer<SUSPEND_SCHEMA>,
       ) => Promise<never>;
       resumeData?: RS extends z.ZodTypeAny ? z.infer<RS> : z.infer<RESUME_SCHEMA>;
+      retryCount?: number;
       logger: Logger;
       writer: WorkflowStreamWriter;
     }) => Promise<NEW_DATA>;
     id: string;
     name?: string;
     purpose?: string;
+    retries?: number;
   }): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, NEW_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA>;
 
   /**
@@ -256,18 +322,22 @@ export class WorkflowChain<
     execute: (context: {
       data: CURRENT_DATA;
       state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-      getStepData: (stepId: string) => { input: any; output: any } | undefined;
+      workflowState: WorkflowStateStore;
+      setWorkflowState: (update: WorkflowStateUpdater) => void;
+      getStepData: (stepId: string) => WorkflowStepData | undefined;
       suspend: (
         reason?: string,
         suspendData?: SS extends z.ZodTypeAny ? z.infer<SS> : z.infer<SUSPEND_SCHEMA>,
       ) => Promise<never>;
       resumeData?: RS extends z.ZodTypeAny ? z.infer<RS> : z.infer<RESUME_SCHEMA>;
+      retryCount?: number;
       logger: Logger;
       writer: WorkflowStreamWriter;
     }) => Promise<z.infer<OS>>;
     id: string;
     name?: string;
     purpose?: string;
+    retries?: number;
   }): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, z.infer<OS>, SUSPEND_SCHEMA, RESUME_SCHEMA>;
 
   /**
@@ -287,18 +357,22 @@ export class WorkflowChain<
     execute: (context: {
       data: CURRENT_DATA;
       state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-      getStepData: (stepId: string) => { input: any; output: any } | undefined;
+      workflowState: WorkflowStateStore;
+      setWorkflowState: (update: WorkflowStateUpdater) => void;
+      getStepData: (stepId: string) => WorkflowStepData | undefined;
       suspend: (
         reason?: string,
         suspendData?: SS extends z.ZodTypeAny ? z.infer<SS> : z.infer<SUSPEND_SCHEMA>,
       ) => Promise<never>;
       resumeData?: z.infer<RS>;
+      retryCount?: number;
       logger: Logger;
       writer: WorkflowStreamWriter;
     }) => Promise<NEW_DATA>;
     id: string;
     name?: string;
     purpose?: string;
+    retries?: number;
   }): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, NEW_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA>;
 
   /**
@@ -330,15 +404,19 @@ export class WorkflowChain<
     execute: (context: {
       data: CURRENT_DATA;
       state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-      getStepData: (stepId: string) => { input: any; output: any } | undefined;
+      workflowState: WorkflowStateStore;
+      setWorkflowState: (update: WorkflowStateUpdater) => void;
+      getStepData: (stepId: string) => WorkflowStepData | undefined;
       suspend: (reason?: string, suspendData?: z.infer<SUSPEND_SCHEMA>) => Promise<never>;
       resumeData?: z.infer<RESUME_SCHEMA>;
+      retryCount?: number;
       logger: Logger;
       writer: WorkflowStreamWriter;
     }) => Promise<NEW_DATA>;
     id: string;
     name?: string;
     purpose?: string;
+    retries?: number;
     inputSchema?: never;
     outputSchema?: never;
     suspendSchema?: z.ZodTypeAny;
@@ -376,7 +454,9 @@ export class WorkflowChain<
       condition: (context: {
         data: z.infer<IS>;
         state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-        getStepData: (stepId: string) => { input: any; output: any } | undefined;
+        workflowState: WorkflowStateStore;
+        setWorkflowState: (update: WorkflowStateUpdater) => void;
+        getStepData: (stepId: string) => WorkflowStepData | undefined;
         suspend: (
           reason?: string,
           suspendData?: SS extends z.ZodTypeAny ? z.infer<SS> : z.infer<SUSPEND_SCHEMA>,
@@ -414,11 +494,11 @@ export class WorkflowChain<
    *     id: "process-pending",
    *     condition: async ({ data }) => data.status === "pending",
    *     execute: async ({ data }) => {
-   *       const result = await agent.generateObject(
+   *       const result = await agent.generateText(
    *         `Process pending request for ${data.userId}`,
-   *         z.object({ processed: z.boolean() })
+   *         { output: Output.object({ schema: z.object({ processed: z.boolean() }) }) }
    *       );
-   *       return { ...data, ...result.object };
+   *       return { ...data, ...result.output };
    *     }
    *   });
    * ```
@@ -469,18 +549,22 @@ export class WorkflowChain<
     execute: (context: {
       data: z.infer<IS>;
       state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-      getStepData: (stepId: string) => { input: any; output: any } | undefined;
+      workflowState: WorkflowStateStore;
+      setWorkflowState: (update: WorkflowStateUpdater) => void;
+      getStepData: (stepId: string) => WorkflowStepData | undefined;
       suspend: (
         reason?: string,
         suspendData?: SS extends z.ZodTypeAny ? z.infer<SS> : z.infer<SUSPEND_SCHEMA>,
       ) => Promise<never>;
       resumeData?: RS extends z.ZodTypeAny ? z.infer<RS> : z.infer<RESUME_SCHEMA>;
+      retryCount?: number;
       logger: Logger;
       writer: WorkflowStreamWriter;
     }) => Promise<void>;
     id: string;
     name?: string;
     purpose?: string;
+    retries?: number;
   }): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, CURRENT_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA>;
 
   /**
@@ -511,15 +595,19 @@ export class WorkflowChain<
     execute: (context: {
       data: CURRENT_DATA;
       state: WorkflowStepState<WorkflowInput<INPUT_SCHEMA>>;
-      getStepData: (stepId: string) => { input: any; output: any } | undefined;
+      workflowState: WorkflowStateStore;
+      setWorkflowState: (update: WorkflowStateUpdater) => void;
+      getStepData: (stepId: string) => WorkflowStepData | undefined;
       suspend: (reason?: string, suspendData?: z.infer<SUSPEND_SCHEMA>) => Promise<never>;
       resumeData?: z.infer<RESUME_SCHEMA>;
+      retryCount?: number;
       logger: Logger;
       writer: WorkflowStreamWriter;
     }) => Promise<void>;
     id: string;
     name?: string;
     purpose?: string;
+    retries?: number;
     inputSchema?: never;
     suspendSchema?: z.ZodTypeAny;
     resumeSchema?: z.ZodTypeAny;
@@ -529,6 +617,136 @@ export class WorkflowChain<
     const finalStep = andTap(config) as WorkflowStep<WorkflowInput<INPUT_SCHEMA>, any, any, any>;
     this.steps.push(finalStep);
     return this;
+  }
+
+  /**
+   * Add a guardrail step to validate or sanitize data
+   */
+  andGuardrail(
+    config: WorkflowStepGuardrailConfig<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA>,
+  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, CURRENT_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA> {
+    this.steps.push(andGuardrail(config));
+    return this;
+  }
+
+  /**
+   * Add a sleep step to the workflow
+   */
+  andSleep(
+    config: WorkflowStepSleepConfig<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA>,
+  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, CURRENT_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA> {
+    this.steps.push(andSleep(config));
+    return this;
+  }
+
+  /**
+   * Add a sleep-until step to the workflow
+   */
+  andSleepUntil(
+    config: WorkflowStepSleepUntilConfig<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA>,
+  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, CURRENT_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA> {
+    this.steps.push(andSleepUntil(config));
+    return this;
+  }
+
+  /**
+   * Add a branching step that runs all matching branches
+   */
+  andBranch<NEW_DATA>(
+    config: WorkflowStepBranchConfig<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA, NEW_DATA>,
+  ): WorkflowChain<
+    INPUT_SCHEMA,
+    RESULT_SCHEMA,
+    Array<NEW_DATA | undefined>,
+    SUSPEND_SCHEMA,
+    RESUME_SCHEMA
+  > {
+    this.steps.push(andBranch(config));
+    return this as unknown as WorkflowChain<
+      INPUT_SCHEMA,
+      RESULT_SCHEMA,
+      Array<NEW_DATA | undefined>,
+      SUSPEND_SCHEMA,
+      RESUME_SCHEMA
+    >;
+  }
+
+  /**
+   * Add a foreach step that runs a step for each item in an array
+   */
+  andForEach<ITEM, NEW_DATA, MAP_DATA = ITEM>(
+    config: WorkflowStepForEachConfig<
+      WorkflowInput<INPUT_SCHEMA>,
+      CURRENT_DATA,
+      ITEM,
+      NEW_DATA,
+      MAP_DATA
+    >,
+  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, NEW_DATA[], SUSPEND_SCHEMA, RESUME_SCHEMA> {
+    this.steps.push(andForEach(config));
+    return this as unknown as WorkflowChain<
+      INPUT_SCHEMA,
+      RESULT_SCHEMA,
+      NEW_DATA[],
+      SUSPEND_SCHEMA,
+      RESUME_SCHEMA
+    >;
+  }
+
+  /**
+   * Add a do-while loop step
+   */
+  andDoWhile<NEW_DATA>(
+    config: WorkflowStepLoopConfig<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA, NEW_DATA>,
+  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, NEW_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA> {
+    this.steps.push(andDoWhile(config));
+    return this as unknown as WorkflowChain<
+      INPUT_SCHEMA,
+      RESULT_SCHEMA,
+      NEW_DATA,
+      SUSPEND_SCHEMA,
+      RESUME_SCHEMA
+    >;
+  }
+
+  /**
+   * Add a do-until loop step
+   */
+  andDoUntil<NEW_DATA>(
+    config: WorkflowStepLoopConfig<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA, NEW_DATA>,
+  ): WorkflowChain<INPUT_SCHEMA, RESULT_SCHEMA, NEW_DATA, SUSPEND_SCHEMA, RESUME_SCHEMA> {
+    this.steps.push(andDoUntil(config));
+    return this as unknown as WorkflowChain<
+      INPUT_SCHEMA,
+      RESULT_SCHEMA,
+      NEW_DATA,
+      SUSPEND_SCHEMA,
+      RESUME_SCHEMA
+    >;
+  }
+
+  /**
+   * Add a mapping step to the workflow
+   */
+  andMap<
+    MAP extends Record<string, WorkflowStepMapEntry<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA>>,
+  >(
+    config: WorkflowStepMapConfig<WorkflowInput<INPUT_SCHEMA>, CURRENT_DATA, MAP>,
+  ): WorkflowChain<
+    INPUT_SCHEMA,
+    RESULT_SCHEMA,
+    WorkflowStepMapResult<MAP>,
+    SUSPEND_SCHEMA,
+    RESUME_SCHEMA
+  > {
+    this.steps.push(andMap(config));
+    return this as unknown as WorkflowChain<
+      INPUT_SCHEMA,
+      RESULT_SCHEMA,
+      WorkflowStepMapResult<MAP>,
+      SUSPEND_SCHEMA,
+      RESUME_SCHEMA
+    >;
   }
 
   /**
@@ -588,11 +806,11 @@ export class WorkflowChain<
    *       {
    *         id: "generate-recommendations",
    *         execute: async ({ data }) => {
-   *           const result = await agent.generateObject(
+   *           const result = await agent.generateText(
    *             `Generate recommendations for user ${data.userId}`,
-   *             z.object({ recommendations: z.array(z.string()) })
+   *             { output: Output.object({ schema: z.object({ recommendations: z.array(z.string()) }) }) }
    *           );
-   *           return result.object;
+   *           return result.output;
    *         }
    *       }
    *     ]
@@ -662,11 +880,15 @@ export class WorkflowChain<
    *       {
    *         id: "ai-fallback",
    *         execute: async ({ data }) => {
-   *           const result = await agent.generateObject(
+   *           const result = await agent.generateText(
    *             `Generate fallback response for: ${data.query}`,
-   *             z.object({ source: z.literal("ai"), result: z.string() })
+   *             {
+   *               output: Output.object({
+   *                 schema: z.object({ source: z.literal("ai"), result: z.string() }),
+   *               }),
+   *             }
    *           );
-   *           return result.object;
+   *           return result.output;
    *         }
    *       }
    *     ]

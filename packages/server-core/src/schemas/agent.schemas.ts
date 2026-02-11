@@ -56,6 +56,61 @@ export const AgentListSchema = z
   .array(AgentResponseSchema)
   .describe("Array of agent objects with their configurations");
 
+// Workspace schemas
+export const WorkspaceInfoSchema = z.object({
+  id: z.string().describe("Workspace ID"),
+  name: z.string().optional().describe("Workspace name"),
+  scope: z.enum(["agent", "conversation"]).optional().describe("Workspace scope"),
+  capabilities: z.object({
+    filesystem: z.boolean().describe("Filesystem access enabled"),
+    sandbox: z.boolean().describe("Sandbox execution enabled"),
+    search: z.boolean().describe("Search enabled"),
+    skills: z.boolean().describe("Skills enabled"),
+  }),
+});
+
+export const WorkspaceFileInfoSchema = z.object({
+  path: z.string(),
+  is_dir: z.boolean(),
+  size: z.number().optional(),
+  modified_at: z.string().optional(),
+});
+
+export const WorkspaceFileListSchema = z.object({
+  path: z.string(),
+  entries: z.array(WorkspaceFileInfoSchema),
+});
+
+export const WorkspaceReadFileSchema = z.object({
+  path: z.string(),
+  content: z.string(),
+});
+
+export const WorkspaceSkillMetadataSchema = z.object({
+  id: z.string(),
+  name: z.string(),
+  description: z.string().optional(),
+  version: z.string().optional(),
+  tags: z.array(z.string()).optional(),
+  path: z.string(),
+  root: z.string(),
+  references: z.array(z.string()).optional(),
+  scripts: z.array(z.string()).optional(),
+  assets: z.array(z.string()).optional(),
+});
+
+export const WorkspaceSkillListItemSchema = WorkspaceSkillMetadataSchema.extend({
+  active: z.boolean().describe("Whether the skill is currently activated"),
+});
+
+export const WorkspaceSkillListSchema = z.object({
+  skills: z.array(WorkspaceSkillListItemSchema),
+});
+
+export const WorkspaceSkillSchema = WorkspaceSkillMetadataSchema.extend({
+  instructions: z.string(),
+});
+
 // Basic JSON schema for structured output (used in both output and object generation)
 export const BasicJsonSchema = z
   .object({
@@ -72,10 +127,50 @@ export const BasicJsonSchema = z
   .passthrough()
   .describe("The Zod schema for the desired object output (passed as JSON)");
 
+const FeedbackConfigSchema = z
+  .object({
+    type: z.enum(["continuous", "categorical", "freeform"]),
+    min: z.number().optional(),
+    max: z.number().optional(),
+    categories: z
+      .array(
+        z.object({
+          value: z.union([z.string(), z.number()]),
+          label: z.string().optional(),
+          description: z.string().optional(),
+        }),
+      )
+      .optional(),
+  })
+  .passthrough()
+  .describe("Feedback configuration for the trace");
+
+const FeedbackExpiresInSchema = z
+  .object({
+    days: z.number().int().optional(),
+    hours: z.number().int().optional(),
+    minutes: z.number().int().optional(),
+  })
+  .passthrough()
+  .describe("Relative expiration for feedback tokens");
+
+const FeedbackOptionsSchema = z
+  .object({
+    key: z.string().optional().describe("Feedback key for the trace"),
+    feedbackConfig: FeedbackConfigSchema.nullish().optional(),
+    expiresAt: z.string().optional().describe("Absolute expiration timestamp (ISO 8601)"),
+    expiresIn: FeedbackExpiresInSchema.optional(),
+  })
+  .passthrough()
+  .describe("Feedback options for the generated trace");
+
 // Generation options schema
 export const GenerateOptionsSchema = z
   .object({
-    userId: z.string().optional().describe("Optional user ID for context tracking"),
+    userId: z
+      .string()
+      .optional()
+      .describe("Optional user ID for context tracking (required for resumable streams)"),
     conversationId: z.string().optional().describe("Optional conversation ID for context tracking"),
     context: z
       .record(z.string(), z.unknown())
@@ -135,6 +230,12 @@ export const GenerateOptionsSchema = z
       .record(z.string(), z.unknown())
       .nullish()
       .describe("Provider-specific options for AI SDK providers (e.g., OpenAI's reasoningEffort)"),
+    resumableStream: z
+      .boolean()
+      .optional()
+      .describe(
+        "When true, avoids wiring the HTTP abort signal into streams so they can be resumed (requires resumable streams and options.conversationId + options.userId). If omitted, server defaults may apply.",
+      ),
     output: z
       .object({
         type: z
@@ -146,6 +247,10 @@ export const GenerateOptionsSchema = z
       })
       .optional()
       .describe("Structured output configuration for schema-guided generation"),
+    feedback: z
+      .union([z.boolean(), FeedbackOptionsSchema])
+      .optional()
+      .describe("Enable or configure feedback tokens for the trace"),
   })
   .passthrough();
 
@@ -180,6 +285,18 @@ export const TextResponseSchema = z.object({
         toolCalls: z.array(z.any()).optional(),
         toolResults: z.array(z.any()).optional(),
         output: z.any().optional().describe("Structured output when output is used"),
+        feedback: z
+          .object({
+            traceId: z.string(),
+            key: z.string(),
+            url: z.string(),
+            tokenId: z.string().optional(),
+            expiresAt: z.string().optional(),
+            feedbackConfig: FeedbackConfigSchema.nullish().optional(),
+          })
+          .nullable()
+          .optional()
+          .describe("Feedback metadata for the trace"),
       })
       .describe("AI SDK formatted response"),
   ]),
@@ -236,7 +353,9 @@ export const WorkflowExecutionRequestSchema = z.object({
     .object({
       userId: z.string().optional(),
       conversationId: z.string().optional(),
+      executionId: z.string().optional(),
       context: z.any().optional(),
+      workflowState: z.record(z.any()).optional(),
     })
     .optional()
     .describe("Optional execution options"),

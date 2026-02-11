@@ -142,6 +142,7 @@ dist
 
 # VoltAgent
 .voltagent
+packages/core/docs
 
 # Create VoltAgent App
 !packages/create-voltagent-app/templates/base/.env
@@ -165,6 +166,8 @@ vitest.config.*.timestamp*
 # claude
 .claude
 skills
+!packages/core/src/workspace/skills
+!packages/core/src/workspace/skills/**
 
 dev-debug.log
 node_modules/
@@ -176,3 +179,9 @@ node_modules/
 .netlify
 
 
+# serena
+.serena
+
+
+# example skills
+!examples/with-workspace/workspace/skills

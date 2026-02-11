@@ -4,19 +4,13 @@ export {
   AGENT_ROUTES,
   WORKFLOW_ROUTES,
   A2A_ROUTES,
+  MEMORY_ROUTES,
   OBSERVABILITY_ROUTES,
   OBSERVABILITY_MEMORY_ROUTES,
   LOG_ROUTES,
 } from "./routes/definitions";
 
-export {
-  handleGetAgents,
-  handleGenerateText,
-  handleStreamText,
-  handleChatStream,
-  handleGenerateObject,
-  handleStreamObject,
-} from "./handlers/agent.handlers";
+export * from "./handlers/agent.handlers";
 
 export {
   handleGetAgent,
@@ -41,6 +35,21 @@ export {
   getConversationStepsHandler,
   getWorkingMemoryHandler,
 } from "./handlers/memory-observability.handlers";
+
+export {
+  handleListMemoryConversations,
+  handleGetMemoryConversation,
+  handleListMemoryConversationMessages,
+  handleGetMemoryWorkingMemory,
+  handleSaveMemoryMessages,
+  handleCreateMemoryConversation,
+  handleUpdateMemoryConversation,
+  handleDeleteMemoryConversation,
+  handleCloneMemoryConversation,
+  handleUpdateMemoryWorkingMemory,
+  handleDeleteMemoryMessages,
+  handleSearchMemory,
+} from "./handlers/memory.handlers";
 
 export {
   resolveAgentCard,

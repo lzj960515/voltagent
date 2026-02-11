@@ -14,6 +14,7 @@ import type {
   GetConversationStepsOptions,
   GetMessagesOptions,
   StorageAdapter,
+  WorkflowRunQuery,
   WorkflowStateEntry,
   WorkingMemoryScope,
 } from "@voltagent/core";
@@ -484,6 +485,7 @@ END OF MIGRATION SQL
     await this.initialize();
 
     const messagesTable = `${this.baseTableName}_messages`;
+    const messageId = message.id || this.generateId();
 
     // Ensure conversation exists
     const conversation = await this.getConversation(conversationId);
@@ -492,16 +494,18 @@ END OF MIGRATION SQL
     }
 
     // Insert message
-    const { error } = await this.client.from(messagesTable).insert({
-      conversation_id: conversationId,
-      message_id: message.id || this.generateId(),
-      user_id: userId,
-      role: message.role,
-      parts: message.parts,
-      metadata: message.metadata || null,
-      format_version: 2,
-      created_at: new Date().toISOString(),
-    });
+    const { error } = await this.client.from(messagesTable).upsert(
+      {
+        conversation_id: conversationId,
+        message_id: messageId,
+        user_id: userId,
+        role: message.role,
+        parts: message.parts,
+        metadata: message.metadata || null,
+        format_version: 2,
+      },
+      { onConflict: "conversation_id,message_id" },
+    );
 
     if (error) {
       throw new Error(`Failed to add message: ${error.message}`);
@@ -524,8 +528,6 @@ END OF MIGRATION SQL
       throw new ConversationNotFoundError(conversationId);
     }
 
-    const now = new Date().toISOString();
-
     // Prepare messages for batch insert
     const messagesToInsert = messages.map((message) => ({
       conversation_id: conversationId,
@@ -535,11 +537,12 @@ END OF MIGRATION SQL
       parts: message.parts,
       metadata: message.metadata || null,
       format_version: 2,
-      created_at: now,
     }));
 
     // Insert all messages
-    const { error } = await this.client.from(messagesTable).insert(messagesToInsert);
+    const { error } = await this.client
+      .from(messagesTable)
+      .upsert(messagesToInsert, { onConflict: "conversation_id,message_id" });
 
     if (error) {
       throw new Error(`Failed to add messages: ${error.message}`);
@@ -575,9 +578,21 @@ END OF MIGRATION SQL
       created_at: step.createdAt ?? new Date().toISOString(),
     }));
 
+    // Supabase/Postgres can error when the same PK appears multiple times in one upsert payload.
+    // Keep the last row for a given id to match existing "last write wins" adapter behavior.
+    const deduplicatedRows = new Map<string, (typeof rows)[number]>();
+    for (const row of rows) {
+      deduplicatedRows.set(row.id, row);
+    }
+    const rowsForUpsert = Array.from(deduplicatedRows.values());
+
+    if (rowsForUpsert.length !== rows.length) {
+      this.log("Deduplicated conversation steps before upsert", rows.length - rowsForUpsert.length);
+    }
+
     const { error } = await this.client
       .from(stepsTable)
-      .upsert(rows, { onConflict: "id", ignoreDuplicates: false });
+      .upsert(rowsForUpsert, { onConflict: "id", ignoreDuplicates: false });
 
     if (error) {
       throw new Error(`Failed to save conversation steps: ${error.message}`);
@@ -619,7 +634,7 @@ END OF MIGRATION SQL
     }
 
     // Order by creation time and apply limit
-    query = query.order("created_at", { ascending: true });
+    query = query.order("created_at", { ascending: false });
     if (limit && limit > 0) {
       query = query.limit(limit);
     }
@@ -631,7 +646,7 @@ END OF MIGRATION SQL
     }
 
     // Convert to UIMessages with on-the-fly migration for old format
-    return (data || []).map((row) => {
+    return (data || []).reverse().map((row) => {
       // Determine parts based on whether we have new format (parts) or old format (content)
       let parts: any;
 
@@ -801,6 +816,33 @@ END OF MIGRATION SQL
     }
 
     this.log(`Cleared messages for user ${userId}`);
+  }
+
+  /**
+   * Delete specific messages by ID for a conversation
+   */
+  async deleteMessages(
+    messageIds: string[],
+    userId: string,
+    conversationId: string,
+  ): Promise<void> {
+    await this.initialize();
+
+    if (messageIds.length === 0) {
+      return;
+    }
+
+    const messagesTable = `${this.baseTableName}_messages`;
+    const { error } = await this.client
+      .from(messagesTable)
+      .delete()
+      .eq("conversation_id", conversationId)
+      .eq("user_id", userId)
+      .in("message_id", messageIds);
+
+    if (error) {
+      throw new Error(`Failed to delete messages: ${error.message}`);
+    }
   }
 
   // ============================================================================
@@ -975,6 +1017,32 @@ END OF MIGRATION SQL
       createdAt: row.created_at,
       updatedAt: row.updated_at,
     }));
+  }
+
+  /**
+   * Count conversations with filters
+   */
+  async countConversations(options: ConversationQueryOptions): Promise<number> {
+    await this.initialize();
+
+    const conversationsTable = `${this.baseTableName}_conversations`;
+    let query = this.client.from(conversationsTable).select("id", { count: "exact", head: true });
+
+    if (options.userId) {
+      query = query.eq("user_id", options.userId);
+    }
+
+    if (options.resourceId) {
+      query = query.eq("resource_id", options.resourceId);
+    }
+
+    const { count, error } = await query;
+
+    if (error) {
+      throw new Error(`Failed to count conversations: ${error.message}`);
+    }
+
+    return count ?? 0;
   }
 
   /**
@@ -1254,14 +1322,7 @@ END OF MIGRATION SQL
   /**
    * Query workflow states with optional filters
    */
-  async queryWorkflowRuns(query: {
-    workflowId?: string;
-    status?: WorkflowStateEntry["status"];
-    from?: Date;
-    to?: Date;
-    limit?: number;
-    offset?: number;
-  }): Promise<WorkflowStateEntry[]> {
+  async queryWorkflowRuns(query: WorkflowRunQuery): Promise<WorkflowStateEntry[]> {
     await this.initialize();
 
     const workflowStatesTable = `${this.baseTableName}_workflow_states`;
@@ -1281,6 +1342,14 @@ END OF MIGRATION SQL
 
     if (query.to) {
       queryBuilder = queryBuilder.lte("created_at", query.to.toISOString());
+    }
+
+    if (query.userId) {
+      queryBuilder = queryBuilder.eq("user_id", query.userId);
+    }
+
+    if (query.metadata && Object.keys(query.metadata).length > 0) {
+      queryBuilder = (queryBuilder as any).contains("metadata", query.metadata);
     }
 
     queryBuilder = queryBuilder.order("created_at", { ascending: false });

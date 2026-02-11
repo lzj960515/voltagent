@@ -78,6 +78,11 @@ const sidebars: SidebarsConfig = {
         },
         {
           type: "doc",
+          id: "tool-routing",
+          label: "Tool Routing",
+        },
+        {
+          type: "doc",
           id: "authentication",
           label: "Authentication",
         },
@@ -85,6 +90,21 @@ const sidebars: SidebarsConfig = {
           type: "doc",
           id: "hooks",
           label: "Hooks",
+        },
+        {
+          type: "doc",
+          id: "tool-hooks",
+          label: "Tool Hooks",
+        },
+        {
+          type: "doc",
+          id: "retrying",
+          label: "Retrying",
+        },
+        {
+          type: "doc",
+          id: "fallback",
+          label: "Fallback",
         },
         {
           type: "doc",

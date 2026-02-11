@@ -21,9 +21,21 @@ const sidebars: SidebarsConfig = {
       label: "LLM Usage & Costs",
     },
     {
+      type: "doc",
+      id: "feedback",
+      label: "Feedback",
+    },
+    {
       type: "category",
       label: "Tracing",
-      items: ["tracing/overview", "tracing/concept"],
+      items: [
+        "tracing/overview",
+        "tracing/waterfall",
+        "tracing/node-based",
+        "tracing/logs",
+        "tracing/feedback",
+        "tracing/users",
+      ],
     },
     {
       type: "doc",

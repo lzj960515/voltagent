@@ -8,12 +8,19 @@ import { FORCED_TOOL_CHOICE_CONTEXT_KEY } from "../agent/context-keys";
 import type { AgentHooks } from "../agent/hooks";
 import { SubAgentManager } from "../agent/subagent";
 import type { SubAgentConfig } from "../agent/subagent/types";
-import type { AgentOptions, OperationContext } from "../agent/types";
+import type {
+  AgentOptions,
+  InstructionsDynamicValue,
+  OperationContext,
+  SupervisorConfig,
+} from "../agent/types";
 import type { Tool, VercelTool } from "../tool";
 import { createTool } from "../tool";
+import type { ToolRoutingConfig } from "../tool/routing/types";
 import type { Toolkit } from "../tool/toolkit";
 import { createToolkit } from "../tool/toolkit";
 import { randomUUID } from "../utils/id";
+import type { PromptContent } from "../voltops/types";
 import { PLAN_PROGRESS_CONTEXT_KEY, PLAN_WRITTEN_CONTEXT_KEY } from "./context-keys";
 import {
   FILESYSTEM_SYSTEM_PROMPT,
@@ -75,34 +82,61 @@ const TASK_SYSTEM_PROMPT = [
   "- You should use the `task` tool whenever you have a complex task that will take multiple steps, and is independent from other tasks that the agent needs to complete. These agents are highly competent and efficient.",
 ].join("\n");
 
+type PlanAgentSubagentConfigDefinition = Exclude<SubAgentConfig, Agent>;
+
+type PlanAgentCustomSubagentDefinition = Omit<
+  AgentOptions,
+  "instructions" | "tools" | "toolkits" | "subAgents" | "supervisorConfig" | "model"
+> & {
+  name: string;
+  description?: string;
+  systemPrompt: string;
+  model?: AgentOptions["model"];
+  tools?: (Tool<any, any> | Toolkit | VercelTool)[];
+  toolkits?: Toolkit[];
+};
+
+type PlanAgentCustomSubagentRuntimeDefinition = {
+  name: string;
+  description?: string;
+  systemPrompt: string;
+  model?: unknown;
+  tools?: (Tool<any, any> | Toolkit | VercelTool)[];
+  toolkits?: Toolkit[];
+  toolRouting?: ToolRoutingConfig | false;
+  memory?: AgentOptions["memory"];
+  logger?: Logger;
+} & Record<string, unknown>;
+
 export type PlanAgentSubagentDefinition =
   | Agent
-  | SubAgentConfig
-  | (Omit<
-      AgentOptions,
-      "instructions" | "tools" | "toolkits" | "subAgents" | "supervisorConfig"
-    > & {
-      name: string;
-      description?: string;
-      systemPrompt: string;
-      model?: AgentOptions["model"];
-      tools?: (Tool<any, any> | Toolkit | VercelTool)[];
-      toolkits?: Toolkit[];
-    });
+  | PlanAgentSubagentConfigDefinition
+  | PlanAgentCustomSubagentDefinition;
+
+const isSubAgentConfigDefinition = (value: unknown): value is PlanAgentSubagentConfigDefinition =>
+  Boolean(value && typeof value === "object" && "method" in value && "agent" in value);
 
 export type TaskToolOptions = {
   systemPrompt?: string | null;
   taskDescription?: string | null;
   maxSteps?: number;
+  supervisorConfig?: SupervisorConfig;
 };
 
 export type PlanAgentOptions = Omit<
   AgentOptions,
-  "instructions" | "tools" | "toolkits" | "subAgents" | "supervisorConfig"
+  | "instructions"
+  | "tools"
+  | "toolkits"
+  | "subAgents"
+  | "supervisorConfig"
+  | "workspace"
+  | "workspaceToolkits"
 > & {
-  systemPrompt?: string;
+  systemPrompt?: InstructionsDynamicValue;
   tools?: (Tool<any, any> | Toolkit | VercelTool)[];
   toolkits?: Toolkit[];
+  toolRouting?: ToolRoutingConfig | false;
   subagents?: PlanAgentSubagentDefinition[];
   generalPurposeAgent?: boolean;
   planning?: PlanningToolkitOptions | false;
@@ -138,6 +172,74 @@ export type PlanAgentExtension = {
   name: string;
   apply: (context: PlanAgentExtensionContext) => PlanAgentExtensionResult | null | undefined;
 };
+
+function buildBaseSystemPrompt(systemPrompt?: string | null): string {
+  return systemPrompt ? `${systemPrompt}\n\n${BASE_PROMPT}` : BASE_PROMPT;
+}
+
+function appendExtensionPrompts(basePrompt: string, extensionPrompts: string[]): string {
+  return extensionPrompts.length > 0 ? [basePrompt, ...extensionPrompts].join("\n\n") : basePrompt;
+}
+
+function isPromptContent(value: unknown): value is PromptContent {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const { type } = value as { type?: string };
+  return type === "text" || type === "chat";
+}
+
+function mergeSystemPromptWithExtensions(
+  resolved: string | PromptContent | null | undefined,
+  extensionPrompts: string[],
+): string | PromptContent {
+  if (isPromptContent(resolved)) {
+    if (resolved.type === "text") {
+      const basePrompt = buildBaseSystemPrompt(resolved.text ?? "");
+      const mergedPrompt = appendExtensionPrompts(basePrompt, extensionPrompts);
+      return { ...resolved, text: mergedPrompt };
+    }
+
+    const messages = Array.isArray(resolved.messages) ? [...resolved.messages] : [];
+    const extraSystemContent = appendExtensionPrompts(BASE_PROMPT, extensionPrompts);
+
+    if (messages.length === 0) {
+      messages.push({ role: "system", content: extraSystemContent });
+      return { ...resolved, messages };
+    }
+
+    let lastSystemIndex = -1;
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      if (messages[i].role === "system") {
+        lastSystemIndex = i;
+        break;
+      }
+    }
+
+    if (lastSystemIndex >= 0) {
+      const target = messages[lastSystemIndex];
+      if (
+        target?.role === "system" &&
+        typeof target.content === "string" &&
+        target.content.trim().length > 0
+      ) {
+        messages[lastSystemIndex] = {
+          ...target,
+          content: `${target.content}\n\n${extraSystemContent}`,
+        };
+      } else {
+        messages.push({ role: "system", content: extraSystemContent });
+      }
+    } else {
+      messages.push({ role: "system", content: extraSystemContent });
+    }
+
+    return { ...resolved, messages };
+  }
+
+  const basePrompt = buildBaseSystemPrompt(typeof resolved === "string" ? resolved : "");
+  return appendExtensionPrompts(basePrompt, extensionPrompts);
+}
 
 function buildTaskToolDescription(subagentDescriptions: string[]): string {
   const availableAgents =
@@ -458,6 +560,38 @@ function chainPrepareModelMessagesHooks(
   };
 }
 
+function chainToolEndHooks(
+  hooks: Array<AgentHooks["onToolEnd"] | null | undefined>,
+): AgentHooks["onToolEnd"] | undefined {
+  const sequence = compactHooks(hooks);
+  if (sequence.length === 0) {
+    return undefined;
+  }
+  return async (args) => {
+    if (args.error) {
+      for (const hook of sequence) {
+        await hook(args);
+      }
+      return undefined;
+    }
+
+    let currentOutput = args.output;
+    let hasOverride = false;
+    for (const hook of sequence) {
+      const result = await hook({ ...args, output: currentOutput });
+      if (result && Object.prototype.hasOwnProperty.call(result, "output")) {
+        currentOutput = result.output;
+        hasOverride = true;
+      }
+    }
+
+    if (hasOverride) {
+      return { output: currentOutput };
+    }
+    return undefined;
+  };
+}
+
 function composeAgentHooks(sequences: {
   onStart?: AgentHooks["onStart"][];
   onEnd?: AgentHooks["onEnd"][];
@@ -476,7 +610,7 @@ function composeAgentHooks(sequences: {
     onHandoff: chainVoidHooks(sequences.onHandoff ?? []),
     onHandoffComplete: chainVoidHooks(sequences.onHandoffComplete ?? []),
     onToolStart: chainVoidHooks(sequences.onToolStart ?? []),
-    onToolEnd: chainVoidHooks(sequences.onToolEnd ?? []),
+    onToolEnd: chainToolEndHooks(sequences.onToolEnd ?? []),
     onPrepareMessages: chainPrepareMessagesHooks(sequences.onPrepareMessages ?? []),
     onPrepareModelMessages: chainPrepareModelMessagesHooks(sequences.onPrepareModelMessages ?? []),
     onError: chainVoidHooks(sequences.onError ?? []),
@@ -519,13 +653,21 @@ function normalizeSubagentDefinitions(options: {
   defaultToolkits: Toolkit[];
   defaultMemory: AgentOptions["memory"];
   defaultLogger?: Logger;
+  defaultToolRouting?: ToolRoutingConfig | false;
 }): Array<{ name: string; description: string; config: SubAgentConfig }> {
-  const { definitions, defaultModel, defaultTools, defaultToolkits, defaultMemory, defaultLogger } =
-    options;
+  const {
+    defaultModel,
+    defaultTools,
+    defaultToolkits,
+    defaultMemory,
+    defaultLogger,
+    defaultToolRouting,
+  } = options;
 
   const normalized: Array<{ name: string; description: string; config: SubAgentConfig }> = [];
+  const rawDefinitions = options.definitions as unknown[];
 
-  for (const definition of definitions) {
+  for (const definition of rawDefinitions) {
     if (definition instanceof Agent) {
       normalized.push({
         name: definition.name,
@@ -535,9 +677,9 @@ function normalizeSubagentDefinitions(options: {
       continue;
     }
 
-    if (definition && typeof definition === "object" && "method" in definition) {
-      const config = definition as SubAgentConfig;
-      const agent = "agent" in config ? config.agent : (config as Agent);
+    if (isSubAgentConfigDefinition(definition)) {
+      const config = definition as PlanAgentSubagentConfigDefinition;
+      const agent = config.agent;
       normalized.push({
         name: agent.name,
         description: getAgentDescription(agent),
@@ -546,20 +688,22 @@ function normalizeSubagentDefinitions(options: {
       continue;
     }
 
-    const custom = definition as Exclude<PlanAgentSubagentDefinition, Agent | SubAgentConfig>;
+    const custom = definition as PlanAgentCustomSubagentRuntimeDefinition;
     const tools = custom.tools ?? defaultTools;
     const toolkits = custom.toolkits ?? defaultToolkits;
+    const model = (custom.model as AgentOptions["model"] | undefined) ?? defaultModel;
 
     const agent = new Agent({
-      ...custom,
+      ...(custom as Record<string, unknown>),
       name: custom.name,
-      model: custom.model ?? defaultModel,
+      model,
       instructions: custom.systemPrompt,
       tools,
       toolkits,
+      toolRouting: custom.toolRouting ?? defaultToolRouting,
       memory: custom.memory ?? defaultMemory,
       logger: custom.logger ?? defaultLogger,
-    });
+    } as AgentOptions);
 
     normalized.push({
       name: agent.name,
@@ -585,6 +729,7 @@ function createTaskToolkit(options: {
   const subAgentManager = new SubAgentManager(
     sourceAgent.name,
     subagents.map((s) => s.config),
+    taskOptions?.supervisorConfig,
   );
   const subagentDescriptions = subagents.map(
     (subagent) => `${subagent.name}: ${subagent.description}`,
@@ -606,7 +751,9 @@ function createTaskToolkit(options: {
     }),
     execute: async (input, executeOptions) => {
       const operationContext = executeOptions as OperationContext;
-      const toolSpan = operationContext.systemContext.get("parentToolSpan") as Span | undefined;
+      const toolSpan =
+        ((executeOptions as any).parentToolSpan as Span | undefined) ||
+        (operationContext.systemContext.get("parentToolSpan") as Span | undefined);
       if (toolSpan) {
         toolSpan.setAttribute("voltagent.label", `task:${input.subagent_type}`);
         toolSpan.setAttribute("planagent.task.subagent_type", input.subagent_type);
@@ -629,7 +776,7 @@ function createTaskToolkit(options: {
         conversationId: operationContext.conversationId,
         parentOperationContext: operationContext,
         maxSteps: taskOptions?.maxSteps,
-        parentSpan: operationContext.systemContext.get("parentToolSpan") as Span | undefined,
+        parentSpan: toolSpan,
       });
 
       if (toolSpan) {
@@ -697,16 +844,17 @@ function createPlanningExtension(options: {
           },
           onToolEnd: async (args) => {
             if (args.error) {
-              return;
+              return undefined;
             }
 
             if (args.tool.name === WRITE_TODOS_TOOL_NAME) {
               args.context.systemContext.set(PLAN_WRITTEN_CONTEXT_KEY, true);
               args.context.systemContext.delete(FORCED_TOOL_CHOICE_CONTEXT_KEY);
-              return;
+              return undefined;
             }
 
             markPlanProgress(args.context);
+            return undefined;
           },
           onStepFinish: async (args) => {
             const step = args.step as StepResult<ToolSet> | undefined;
@@ -814,7 +962,9 @@ export class PlanAgent extends Agent {
           ((context: FilesystemBackendContext) =>
             new InMemoryFilesystemBackend(context.state.files || {}));
 
-    const baseSystemPrompt = systemPrompt ? `${systemPrompt}\n\n${BASE_PROMPT}` : BASE_PROMPT;
+    const baseSystemPrompt = buildBaseSystemPrompt(
+      typeof systemPrompt === "string" ? systemPrompt : undefined,
+    );
     const taskOptions = task === false ? undefined : task;
     const taskSystemPrompt =
       taskOptions?.systemPrompt === undefined
@@ -842,10 +992,12 @@ export class PlanAgent extends Agent {
       .map((result) => result.systemPrompt)
       .filter((prompt): prompt is string => Boolean(prompt && prompt.trim().length > 0));
 
-    const finalSystemPrompt =
-      extensionPrompts.length > 0
-        ? [baseSystemPrompt, ...extensionPrompts].join("\n\n")
-        : baseSystemPrompt;
+    const finalSystemPrompt = appendExtensionPrompts(baseSystemPrompt, extensionPrompts);
+    const instructions: InstructionsDynamicValue =
+      typeof systemPrompt === "function"
+        ? async (dynamicOptions) =>
+            mergeSystemPromptWithExtensions(await systemPrompt(dynamicOptions), extensionPrompts)
+        : finalSystemPrompt;
 
     const extensionHooks = extensionResults.flatMap((result) =>
       result.hooks ? [result.hooks] : [],
@@ -872,10 +1024,14 @@ export class PlanAgent extends Agent {
       onError: [...extensionHooks.map((hook) => hook.onError), hooks?.onError],
     });
 
+    const sanitizedAgentOptions = { ...(agentOptions as AgentOptions) };
+    (sanitizedAgentOptions as Record<string, unknown>).workspace = undefined;
+    (sanitizedAgentOptions as Record<string, unknown>).workspaceToolkits = undefined;
+
     super({
-      ...agentOptions,
+      ...sanitizedAgentOptions,
       name: name || "plan-agent",
-      instructions: finalSystemPrompt,
+      instructions,
       summarization,
       tools: [],
       toolkits: [],
@@ -953,6 +1109,7 @@ export class PlanAgent extends Agent {
       defaultToolkits: subagentToolkits,
       defaultMemory: options.memory,
       defaultLogger: options.logger,
+      defaultToolRouting: options.toolRouting,
     });
 
     if (generalPurposeAgent) {
@@ -967,6 +1124,7 @@ export class PlanAgent extends Agent {
           instructions: DEFAULT_SUBAGENT_PROMPT,
           tools: wrappedTools,
           toolkits: subagentToolkits,
+          toolRouting: options.toolRouting,
           memory: options.memory,
           logger: options.logger,
         });

@@ -37,60 +37,53 @@ import clsx from "clsx";
 import React, { useState } from "react";
 import { DiscordLogo } from "../../../static/img/logos/discord";
 import { GitHubLogo } from "../../../static/img/logos/github";
-
-// Santa Claus Icon Component
-const SantaIcon = ({ className }: { className?: string }) => (
-  <svg viewBox="0 0 24 24" fill="none" xmlns="http://www.w3.org/2000/svg" className={className}>
-    {/* Face */}
-    <circle cx="12" cy="13" r="8" fill="#FDBF6F" />
-    {/* Hat */}
-    <path d="M4 11C4 11 5 4 12 4C19 4 20 11 20 11L12 9L4 11Z" fill="#CC0000" />
-    <ellipse cx="12" cy="11" rx="9" ry="2" fill="white" />
-    {/* Hat pom-pom */}
-    <circle cx="19" cy="5" r="2.5" fill="white" />
-    {/* Hat tip curve */}
-    <path d="M12 4C12 4 16 3 19 5" stroke="#CC0000" strokeWidth="3" strokeLinecap="round" />
-    {/* Eyes */}
-    <circle cx="9" cy="12" r="1" fill="#333" />
-    <circle cx="15" cy="12" r="1" fill="#333" />
-    {/* Rosy cheeks */}
-    <circle cx="7" cy="14" r="1.2" fill="#FF9999" opacity="0.6" />
-    <circle cx="17" cy="14" r="1.2" fill="#FF9999" opacity="0.6" />
-    {/* Nose */}
-    <circle cx="12" cy="14" r="1.2" fill="#E88" />
-    {/* Beard */}
-    <path
-      d="M4 15C4 15 4 22 12 22C20 22 20 15 20 15C20 15 18 16 12 16C6 16 4 15 4 15Z"
-      fill="white"
-    />
-    {/* Mustache */}
-    <path
-      d="M7 15.5C7 15.5 9 16.5 12 16.5C15 16.5 17 15.5 17 15.5C17 15.5 15 17 12 17C9 17 7 15.5 7 15.5Z"
-      fill="white"
-    />
-  </svg>
-);
 import { useGitHubStars } from "../../contexts/GitHubStarsContext";
 import useCasesData from "../usecases/usecases.json";
 import styles from "./styles.module.css";
 
 // Docs page tab configuration
 const docTabs = [
-  { label: "VoltAgent", href: "/docs/", match: "/docs/" },
-  { label: "Observability", href: "/observability-docs/", match: "/observability-docs/" },
+  { label: "Home", href: "/docs/", match: (path: string) => path === "/docs/" },
+  {
+    label: "VoltAgent Framework",
+    href: "/docs/overview/",
+    match: (path: string) => path.startsWith("/docs/overview/"),
+  },
+  {
+    label: "Models",
+    href: "/models-docs/",
+    match: (path: string) => path.startsWith("/models-docs/"),
+  },
+  {
+    label: "Observability",
+    href: "/observability-docs/",
+    match: (path: string) => path.startsWith("/observability-docs/"),
+  },
   {
     label: "Actions & Triggers",
     href: "/actions-triggers-docs/",
-    match: "/actions-triggers-docs/",
+    match: (path: string) => path.startsWith("/actions-triggers-docs/"),
   },
-  { label: "Evaluation", href: "/evaluation-docs/", match: "/evaluation-docs/" },
+  {
+    label: "Evaluation",
+    href: "/evaluation-docs/",
+    match: (path: string) => path.startsWith("/evaluation-docs/"),
+  },
   {
     label: "Prompt Engineering",
     href: "/prompt-engineering-docs/",
-    match: "/prompt-engineering-docs/",
+    match: (path: string) => path.startsWith("/prompt-engineering-docs/"),
   },
-  { label: "Deployment", href: "/deployment-docs/", match: "/deployment-docs/" },
-  { label: "Recipes & Guides", href: "/recipes-and-guides/", match: "/recipes-and-guides/" },
+  {
+    label: "Deployment",
+    href: "/deployment-docs/",
+    match: (path: string) => path.startsWith("/deployment-docs/"),
+  },
+  {
+    label: "Recipes & Guides",
+    href: "/recipes-and-guides/",
+    match: (path: string) => path.startsWith("/recipes-and-guides/"),
+  },
 ];
 
 export default function Navbar() {
@@ -101,6 +94,9 @@ export default function Navbar() {
   const isMobile = useMediaQuery("(max-width: 768px)", { defaultValue: true });
 
   const location = useLocation();
+  const normalizedPathname = location.pathname.endsWith("/")
+    ? location.pathname
+    : `${location.pathname}/`;
   const { stars, recent_stargazers, loading: isLoadingStars, error: starsError } = useGitHubStars();
 
   // Icon mapping for use cases
@@ -119,14 +115,6 @@ export default function Navbar() {
     "documentation-agent": DocumentTextIcon,
   };
 
-  const _isActive = (path: string) => {
-    const currentPath = location.pathname.endsWith("/")
-      ? location.pathname
-      : `${location.pathname}/`;
-    const checkPath = path.endsWith("/") ? path : `${path}/`;
-    return currentPath.startsWith(checkPath);
-  };
-
   // Helper function to format star count
   const formatStarCount = (count: number | null | undefined): string => {
     if (count === null || count === undefined) return "✨";
@@ -143,13 +131,14 @@ export default function Navbar() {
 
   // Check if current page is a docs page
   const isDocsPage =
-    location.pathname.includes("/docs") ||
-    location.pathname.includes("/observability-docs") ||
-    location.pathname.includes("/evaluation-docs") ||
-    location.pathname.includes("/prompt-engineering-docs") ||
-    location.pathname.includes("/deployment-docs") ||
-    location.pathname.includes("/actions-triggers-docs") ||
-    location.pathname.startsWith("/recipes-and-guides/");
+    normalizedPathname.includes("/docs") ||
+    normalizedPathname.includes("/models-docs") ||
+    normalizedPathname.includes("/observability-docs") ||
+    normalizedPathname.includes("/evaluation-docs") ||
+    normalizedPathname.includes("/prompt-engineering-docs") ||
+    normalizedPathname.includes("/deployment-docs") ||
+    normalizedPathname.includes("/actions-triggers-docs") ||
+    normalizedPathname.startsWith("/recipes-and-guides/");
 
   // Render docs navbar for documentation pages
   if (isDocsPage) {
@@ -159,7 +148,7 @@ export default function Navbar() {
         <div className={styles.docsNavbarTop}>
           <div className={styles.docsLeftSection}>
             <Link to="/docs/" className={styles.docsLogoLink}>
-              <SantaIcon className={styles.docsLogoIcon} />
+              <BoltIcon className={styles.docsLogoIcon} />
               <span className={styles.docsLogoText}>voltagent</span>
               <span className={styles.docsDocsText}>Docs</span>
             </Link>
@@ -234,7 +223,7 @@ export default function Navbar() {
                 to={tab.href}
                 className={clsx(
                   styles.docsTab,
-                  location.pathname.startsWith(tab.match) && styles.docsTabActive,
+                  tab.match(normalizedPathname) && styles.docsTabActive,
                 )}
               >
                 {tab.label}
@@ -252,7 +241,9 @@ export default function Navbar() {
       <div className={styles.navbarInner}>
         <div className={styles.navbarLeft}>
           <Link to="/" className={styles.logoLink}>
-            <SantaIcon className="w-5 h-5" />
+            <div className="flex items-center border-solid border-1 border-main-emerald rounded-full  p-1">
+              <BoltIcon className="w-4 h-4  text-main-emerald" />
+            </div>
             <span className={styles.logoText}>voltagent</span>
           </Link>
           <div className={`${styles.navLinks} ${isMenuOpen ? styles.navLinksOpen : ""}`}>
@@ -405,7 +396,10 @@ export default function Navbar() {
               </div>
             </div>
             <Link to="/docs/" className={`${styles.navLink}  `}>
-              Docs
+              Documentation
+            </Link>
+            <Link to="/pricing/" className={`${styles.navLink}`}>
+              Pricing
             </Link>
 
             <div className={`${styles.navLink} group relative`}>
@@ -721,6 +715,9 @@ export default function Navbar() {
           </Link>
           <Link to="/recipes-and-guides/" className={`${styles.mobileNavLink}`}>
             Recipes & Guides
+          </Link>
+          <Link to="/pricing/" className={`${styles.mobileNavLink}`}>
+            Pricing
           </Link>
 
           <div className={styles.mobileNavLink}>

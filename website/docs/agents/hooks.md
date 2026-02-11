@@ -27,7 +27,6 @@ import {
   type OnToolEndHookArgs,
   type OnHandoffHookArgs,
 } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 // Define a collection of hooks using the helper
 const myAgentHooks = createHooks({
@@ -141,7 +140,7 @@ const myAgentHooks = createHooks({
 const agentWithHooks = new Agent({
   name: "My Agent with Hooks",
   instructions: "An assistant demonstrating hooks",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   hooks: myAgentHooks,
 });
 
@@ -149,7 +148,7 @@ const agentWithHooks = new Agent({
 const agentWithInlineHooks = new Agent({
   name: "Inline Hooks Agent",
   instructions: "Another assistant",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   hooks: {
     onStart: async ({ agent, context }) => {
       /* ... */
@@ -173,7 +172,7 @@ Method-level hooks do not override agent-level hooks. Both will execute. For mos
 const agent = new Agent({
   name: "My Agent with Hooks",
   instructions: "An assistant demonstrating hooks",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
   hooks: myAgentHooks,
 });
 
@@ -192,7 +191,7 @@ For example, store conversation history only for specific endpoints:
 const agent = new Agent({
   name: "Translation Agent",
   instructions: "A translation agent that translates text from English to French",
-  model: openai("gpt-4o"),
+  model: "openai/gpt-4o",
 });
 
 // for the translate endpoint, we don't want to store the conversation history
@@ -346,10 +345,49 @@ onEnd: async ({ agent, output, error, conversationId, context }) => {
 };
 ```
 
+### `onRetry`
+
+- **Triggered:** When VoltAgent schedules a retry for an LLM attempt or a middleware abort.
+- **Argument Object (`OnRetryHookArgs`):** Includes `source`, `operation`, `context`, and retry details.
+- **Use Cases:** Retry metrics, alerts, tracking retry sources.
+
+```ts
+onRetry: async (args) => {
+  if (args.source === "llm") {
+    console.log(
+      `LLM retry ${args.nextAttempt}/${args.maxRetries + 1} for ${args.modelName} (${args.operation})`
+    );
+  } else {
+    console.log(
+      `Middleware retry ${args.retryCount + 1}/${args.maxRetries + 1} for ${args.middlewareId ?? "unknown"}`
+    );
+  }
+};
+```
+
+### `onFallback`
+
+- **Triggered:** When VoltAgent selects the next model candidate.
+- **Argument Object (`OnFallbackHookArgs`):** Includes `stage`, `fromModel`, `fromModelIndex`, `nextModel`, and `error`.
+- **Use Cases:** Tracking model failover, audit logs, fallback diagnostics.
+
+```ts
+onFallback: async ({ stage, fromModel, nextModel, operation }) => {
+  console.warn(
+    `Fallback (${stage}) from ${fromModel} to ${nextModel ?? "next"} during ${operation}`
+  );
+};
+```
+
 ### `onToolStart`
 
 - **Triggered:** Before an agent executes a tool.
-- **Argument Object (`OnToolStartHookArgs`):** `{ agent: Agent, tool: AgentTool, args: any, context: OperationContext }`
+- **Argument Object (`OnToolStartHookArgs`):**
+  - `agent`: Agent instance running the tool
+  - `tool`: The tool being executed
+  - `args`: Tool input arguments
+  - `context`: Operation context for the current call
+  - `options`: ToolExecuteOptions (includes `toolContext`, `abortController`, etc.)
 - **Use Cases:** Logging tool usage, inspecting tool arguments, or validating inputs before execution.
 
 ```ts
@@ -363,7 +401,14 @@ onToolStart: async ({ agent, tool, args, context }) => {
 ### `onToolEnd`
 
 - **Triggered:** After a tool execution completes or throws an error.
-- **Argument Object (`OnToolEndHookArgs`):** `{ agent: Agent, tool: AgentTool, output: unknown | undefined, error: VoltAgentError | undefined, context: OperationContext }`
+- **Argument Object (`OnToolEndHookArgs`):**
+  - `agent`: Agent instance running the tool
+  - `tool`: The tool that completed
+  - `output`: Tool output (undefined on error)
+  - `error`: VoltAgentError when tool throws (undefined on success)
+  - `context`: Operation context for the current call
+  - `options`: ToolExecuteOptions (includes `toolContext`, `abortController`, etc.)
+- **Return:** `{ output }` to replace the tool result. The replacement is validated again if the tool has an `outputSchema`.
 - **Use Cases:** Logging tool results or errors, post-processing output, triggering actions based on success or failure.
 
 ```ts
@@ -380,6 +425,37 @@ onToolEnd: async ({ agent, tool, output, error, context }) => {
     );
   }
 };
+```
+
+### Tool-level hooks (per tool)
+
+Tool hooks run for a specific tool instance and are called before/after execution. Tool-level `onEnd` runs before agent-level `onToolEnd`. If both return `{ output }`, the agent hook wins. Any override is re-validated when `outputSchema` is present.
+
+**Tool hook parameters:**
+
+- `onStart`: `{ tool, args, options }`
+- `onEnd`: `{ tool, args, output, error, options }` (return `{ output }` to override)
+
+```ts
+import { createTool } from "@voltagent/core";
+import { z } from "zod";
+
+const normalizeTool = createTool({
+  name: "normalize_text",
+  description: "Normalize and trim text",
+  parameters: z.object({ text: z.string() }),
+  execute: async ({ text }) => text,
+  hooks: {
+    onStart: ({ tool }) => {
+      console.log(`[tool] ${tool.name} starting`);
+    },
+    onEnd: ({ output }) => {
+      if (typeof output === "string") {
+        return { output: output.trim() };
+      }
+    },
+  },
+});
 ```
 
 ### `onHandoff`
@@ -400,15 +476,15 @@ onHandoff: async ({ agent, sourceAgent }) => {
 - **Async Execution:** Hooks can be `async` functions. VoltAgent awaits completion before proceeding. Long-running operations in hooks add latency to agent response time.
 - **Error Handling:** Errors thrown inside hooks may interrupt agent execution. Use `try...catch` within hooks or design them to be reliable.
 - **Hook Merging:** When hooks are passed to both the Agent constructor and a method call:
-  - Most hooks (`onStart`, `onEnd`, `onError`, `onHandoff`, `onToolStart`, `onToolEnd`, `onStepFinish`) execute both: method-level first, then agent-level.
+  - Most hooks (`onStart`, `onEnd`, `onError`, `onHandoff`, `onToolStart`, `onToolEnd`, `onStepFinish`, `onRetry`, `onFallback`) execute both: method-level first, then agent-level.
   - Message hooks (`onPrepareMessages`, `onPrepareModelMessages`) do not merge: method-level replaces agent-level entirely.
 
 ## Additional Hooks
 
-Two additional hooks exist for advanced use cases:
-
 - **`onError`**: Called when an error occurs during agent execution. Receives `{ agent: Agent, error: Error, context: OperationContext }`.
 - **`onStepFinish`**: Called after each step in multi-step agent execution. Receives `{ agent: Agent, step: any, context: OperationContext }`.
+- **`onRetry`**: Called when VoltAgent schedules a retry. Receives `{ source, operation, ... }` with retry metadata.
+- **`onFallback`**: Called when VoltAgent selects the next model candidate. Receives `{ stage, fromModel, nextModel, error, ... }`.
 
 ## Common Use Cases
 
@@ -427,7 +503,6 @@ Transform messages before they reach the LLM using `onPrepareMessages` and messa
 
 ```ts
 import { Agent, createHooks, messageHelpers } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 const enhancedHooks = createHooks({
   onPrepareMessages: async ({ messages, context }) => {
@@ -471,7 +546,7 @@ const enhancedHooks = createHooks({
 const agent = new Agent({
   name: "Privacy-Aware Assistant",
   instructions: "A helpful assistant that protects user privacy",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
   hooks: enhancedHooks,
 });
 

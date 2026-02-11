@@ -58,11 +58,10 @@ const content: MessageContent = [
 
 ```typescript
 import { generateText } from "ai";
-import { openai } from "@ai-sdk/openai";
 
 // Using MessageContent in direct AI SDK calls
 const result = await generateText({
-  model: openai("gpt-4"),
+  model: "openai/gpt-4",
   messages: [
     {
       role: "user",
@@ -151,6 +150,22 @@ conversationHistory.forEach((msg) => {
 });
 ```
 
+#### Feedback metadata
+
+When feedback is enabled, VoltAgent attaches feedback metadata to assistant UI messages under `message.metadata.feedback`. This is how UIs can show thumbs up/down and submit feedback later.
+
+```ts
+const feedback = message.metadata?.feedback as
+  | { traceId?: string; key?: string; url?: string }
+  | undefined;
+
+if (feedback?.url) {
+  console.log("Submit feedback to:", feedback.url);
+}
+```
+
+See [Feedback](/observability-docs/feedback) for the full flow and API examples.
+
 ### 3. VoltAgentTextStreamPart (Streaming Extension)
 
 **VoltAgentTextStreamPart** extends AI SDK's `TextStreamPart` with SubAgent metadata, enabling multi-agent coordination during streaming.
@@ -160,6 +175,11 @@ conversationHistory.forEach((msg) => {
 ```typescript
 type VoltAgentTextStreamPart<TOOLS extends Record<string, any> = Record<string, any>> =
   TextStreamPart<TOOLS> & {
+    /**
+     * Optional response message identifier (carried on start/step chunks).
+     */
+    messageId?: string;
+
     /**
      * Optional identifier for the subagent that generated this event
      */

@@ -63,6 +63,11 @@ export const DEFAULT_CONSOLE_ROUTES = [
   "GET /agents/:id/card",
 
   "GET /agents/:id/history",
+  "GET /agents/:id/workspace",
+  "GET /agents/:id/workspace/ls",
+  "GET /agents/:id/workspace/read",
+  "GET /agents/:id/workspace/skills",
+  "GET /agents/:id/workspace/skills/:skillId",
   "GET /workflows/executions",
   "GET /workflows/:id/executions/:executionId/state",
   "GET /api/logs",
@@ -87,8 +92,14 @@ export const PROTECTED_ROUTES = [
   "POST /agents/:id/text", // generateText
   "POST /agents/:id/stream", // streamText
   "POST /agents/:id/chat", // chatStream
+  "GET /agents/:id/chat/:conversationId/stream", // resumeChatStream
   "POST /agents/:id/object", // generateObject
   "POST /agents/:id/stream-object", // streamObject
+  "GET /agents/:id/workspace", // workspace info
+  "GET /agents/:id/workspace/ls", // workspace list files
+  "GET /agents/:id/workspace/read", // workspace read file
+  "GET /agents/:id/workspace/skills", // workspace list skills
+  "GET /agents/:id/workspace/skills/:skillId", // workspace skill
   "WS /ws/agents/:id", // WebSocket connection
 
   // ========================================
@@ -108,6 +119,11 @@ export const PROTECTED_ROUTES = [
   "POST /workflows/:id/executions/:executionId/suspend", // Suspend execution
   "POST /workflows/:id/executions/:executionId/resume", // Resume execution
   "POST /workflows/:id/executions/:executionId/cancel", // Cancel execution
+
+  // ========================================
+  // MEMORY (User Data)
+  // ========================================
+  "/api/memory/*", // All memory endpoints (GET/POST/PATCH/DELETE)
 
   // ========================================
   // OBSERVABILITY (Admin/Internal Tooling)

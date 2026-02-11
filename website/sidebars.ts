@@ -13,6 +13,11 @@ import type { SidebarsConfig } from "@docusaurus/plugin-content-docs";
 const sidebars: SidebarsConfig = {
   docs: [
     {
+      type: "doc",
+      id: "home",
+      label: "Home",
+    },
+    {
       type: "category",
       label: "Get Started",
       collapsed: true,
@@ -27,7 +32,7 @@ const sidebars: SidebarsConfig = {
           },
           items: ["getting-started/quick-start", "getting-started/manual-setup"],
         },
-        "getting-started/mcp-docs-server",
+        "getting-started/ai-assistants",
         {
           type: "link",
           label: "5-Step Tutorial",
@@ -38,6 +43,7 @@ const sidebars: SidebarsConfig = {
           },
         },
         "getting-started/providers-models",
+        "getting-started/model-router",
         "getting-started/comparison",
         "getting-started/migration-guide",
       ],
@@ -48,6 +54,11 @@ const sidebars: SidebarsConfig = {
       collapsed: true,
       items: [
         "agents/overview",
+        {
+          type: "doc",
+          id: "agents/voltagent-instance",
+          label: "VoltAgent Instance",
+        },
         "agents/prompts",
         "agents/tools",
         {
@@ -80,27 +91,61 @@ const sidebars: SidebarsConfig = {
         },
         "agents/a2a/a2a-server",
         "agents/hooks",
+        "agents/middleware",
         "agents/message-types",
         "agents/multi-modal",
         "agents/providers",
+        "agents/retries-fallback",
         "agents/subagents",
         "agents/voice",
         "agents/context",
         "agents/dynamic-agents",
         "agents/cancellation",
+        "agents/resumable-streaming",
       ],
     },
     {
       type: "category",
-      label: "Guardrails",
+      label: "Workspaces",
       collapsed: true,
       customProps: {
         badge: {
-          label: "New",
+          label: "Experimental",
           variant: "accent",
         },
       },
-      items: ["guardrails/overview", "guardrails/built-in"],
+      items: [
+        {
+          type: "doc",
+          id: "workspaces/overview",
+          label: "Overview",
+        },
+        {
+          type: "doc",
+          id: "workspaces/filesystem",
+          label: "Filesystem",
+        },
+        {
+          type: "doc",
+          id: "workspaces/search",
+          label: "Search",
+        },
+        {
+          type: "doc",
+          id: "workspaces/sandbox",
+          label: "Sandbox",
+        },
+        {
+          type: "doc",
+          id: "workspaces/skills",
+          label: "Skills",
+        },
+        {
+          type: "doc",
+          id: "workspaces/security",
+          label: "Security",
+        },
+      ],
     },
     {
       type: "category",
@@ -110,27 +155,35 @@ const sidebars: SidebarsConfig = {
         "workflows/overview",
         "workflows/suspend-resume",
         "workflows/execute-api",
+        "workflows/workflow-state",
         "workflows/streaming",
         "workflows/hooks",
         "workflows/schemas",
         "workflows/steps/and-then",
         "workflows/steps/and-agent",
         "workflows/steps/and-when",
+        "workflows/steps/and-branch",
         "workflows/steps/and-tap",
+        "workflows/steps/and-guardrail",
         "workflows/steps/and-all",
         "workflows/steps/and-race",
+        "workflows/steps/and-foreach",
+        "workflows/steps/and-loop",
+        "workflows/steps/and-sleep",
+        "workflows/steps/and-sleep-until",
+        "workflows/steps/and-map",
       ],
+    },
+    {
+      type: "category",
+      label: "Guardrails",
+      collapsed: true,
+      items: ["guardrails/overview", "guardrails/built-in"],
     },
     {
       type: "doc",
       id: "evals",
       label: "Evals",
-      customProps: {
-        badge: {
-          label: "New",
-          variant: "accent",
-        },
-      },
     },
     {
       type: "category",
@@ -156,6 +209,7 @@ const sidebars: SidebarsConfig = {
               },
             },
             "agents/memory/libsql",
+            "agents/memory/cloudflare-d1",
             "agents/memory/postgres",
             "agents/memory/supabase",
           ],
@@ -166,29 +220,17 @@ const sidebars: SidebarsConfig = {
       type: "doc",
       id: "triggers",
       label: "Triggers",
-      customProps: {
-        badge: {
-          label: "New",
-          variant: "accent",
-        },
-      },
     },
     {
       type: "doc",
       id: "actions",
       label: "Actions",
-      customProps: {
-        badge: {
-          label: "New",
-          variant: "accent",
-        },
-      },
     },
     {
       type: "category",
       label: "Tools",
       collapsed: true,
-      items: ["tools/overview", "tools/reasoning-tool"],
+      items: ["tools/overview", "tools/tool-routing", "tools/reasoning-tool"],
     },
     {
       type: "category",
@@ -239,7 +281,12 @@ const sidebars: SidebarsConfig = {
         {
           type: "category",
           label: "Endpoints",
-          items: ["api/endpoints/agents", "api/endpoints/workflows", "api/endpoints/tools"],
+          items: [
+            "api/endpoints/agents",
+            "api/endpoints/workflows",
+            "api/endpoints/memory",
+            "api/endpoints/tools",
+          ],
         },
       ],
     },

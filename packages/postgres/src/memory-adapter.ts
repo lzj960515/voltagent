@@ -14,6 +14,7 @@ import type {
   GetConversationStepsOptions,
   GetMessagesOptions,
   StorageAdapter,
+  WorkflowRunQuery,
   WorkflowStateEntry,
   WorkingMemoryScope,
 } from "@voltagent/core";
@@ -325,6 +326,7 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
       await client.query("BEGIN");
 
       const messagesTable = this.getTableName(`${this.tablePrefix}_messages`);
+      const messageId = message.id || this.generateId();
 
       // Ensure conversation exists
       const conversation = await this.getConversation(conversationId);
@@ -336,10 +338,16 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
       await client.query(
         `INSERT INTO ${messagesTable} 
          (conversation_id, message_id, user_id, role, parts, metadata, format_version, created_at) 
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+         ON CONFLICT (conversation_id, message_id) DO UPDATE SET
+           user_id = EXCLUDED.user_id,
+           role = EXCLUDED.role,
+           parts = EXCLUDED.parts,
+           metadata = EXCLUDED.metadata,
+           format_version = EXCLUDED.format_version`,
         [
           conversationId,
-          message.id || this.generateId(),
+          messageId,
           userId,
           message.role,
           safeStringify(message.parts),
@@ -381,13 +389,20 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
 
       // Insert all messages
       for (const message of messages) {
+        const messageId = message.id || this.generateId();
         await client.query(
           `INSERT INTO ${messagesTable} 
            (conversation_id, message_id, user_id, role, parts, metadata, format_version, created_at) 
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           ON CONFLICT (conversation_id, message_id) DO UPDATE SET
+             user_id = EXCLUDED.user_id,
+             role = EXCLUDED.role,
+             parts = EXCLUDED.parts,
+             metadata = EXCLUDED.metadata,
+             format_version = EXCLUDED.format_version`,
           [
             conversationId,
-            message.id || this.generateId(),
+            messageId,
             userId,
             message.role,
             safeStringify(message.parts),
@@ -515,8 +530,9 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
       });
 
       // Build query with filters - use SELECT * to handle both old and new schemas safely
-      let sql = `SELECT * FROM ${messagesTable}
-                 WHERE conversation_id = $1 AND user_id = $2`;
+      let sql = `SELECT * FROM (
+             SELECT * FROM ${messagesTable}
+             WHERE conversation_id = $1 AND user_id = $2`;
       const params: any[] = [conversationId, userId];
       let paramCount = 3;
 
@@ -551,11 +567,13 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
       }
 
       // Order by creation time and apply limit
-      sql += " ORDER BY created_at ASC";
+      sql += " ORDER BY created_at DESC";
       if (limit && limit > 0) {
         sql += ` LIMIT $${paramCount}`;
         params.push(limit);
       }
+
+      sql += " ) AS subq ORDER BY created_at ASC";
 
       // Debug: Final SQL and parameters
       this.log("Final SQL query:", sql);
@@ -779,6 +797,33 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
     }
   }
 
+  /**
+   * Delete specific messages by ID for a conversation
+   */
+  async deleteMessages(
+    messageIds: string[],
+    userId: string,
+    conversationId: string,
+  ): Promise<void> {
+    await this.initPromise;
+
+    if (messageIds.length === 0) {
+      return;
+    }
+
+    const client = await this.pool.connect();
+    try {
+      const messagesTable = this.getTableName(`${this.tablePrefix}_messages`);
+      await client.query(
+        `DELETE FROM ${messagesTable}
+         WHERE conversation_id = $1 AND user_id = $2 AND message_id = ANY($3::text[])`,
+        [conversationId, userId, messageIds],
+      );
+    } finally {
+      client.release();
+    }
+  }
+
   // ============================================================================
   // Conversation Operations
   // ============================================================================
@@ -956,6 +1001,39 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
         createdAt: row.created_at,
         updatedAt: row.updated_at,
       }));
+    } finally {
+      client.release();
+    }
+  }
+
+  /**
+   * Count conversations with filters
+   */
+  async countConversations(options: ConversationQueryOptions): Promise<number> {
+    await this.initPromise;
+
+    const client = await this.pool.connect();
+    try {
+      const conversationsTable = this.getTableName(`${this.tablePrefix}_conversations`);
+      let sql = `SELECT COUNT(*) as count FROM ${conversationsTable} WHERE 1=1`;
+      const params: any[] = [];
+      let paramCount = 1;
+
+      if (options.userId) {
+        sql += ` AND user_id = $${paramCount}`;
+        params.push(options.userId);
+        paramCount++;
+      }
+
+      if (options.resourceId) {
+        sql += ` AND resource_id = $${paramCount}`;
+        params.push(options.resourceId);
+        paramCount++;
+      }
+
+      const result = await client.query(sql, params);
+      const count = Number(result.rows[0]?.count ?? 0);
+      return Number.isNaN(count) ? 0 : count;
     } finally {
       client.release();
     }
@@ -1243,14 +1321,7 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
   /**
    * Query workflow states with optional filters
    */
-  async queryWorkflowRuns(query: {
-    workflowId?: string;
-    status?: WorkflowStateEntry["status"];
-    from?: Date;
-    to?: Date;
-    limit?: number;
-    offset?: number;
-  }): Promise<WorkflowStateEntry[]> {
+  async queryWorkflowRuns(query: WorkflowRunQuery): Promise<WorkflowStateEntry[]> {
     await this.initPromise;
 
     const workflowStatesTable = this.getTableName(`${this.tablePrefix}_workflow_states`);
@@ -1276,6 +1347,16 @@ export class PostgreSQLMemoryAdapter implements StorageAdapter {
     if (query.to) {
       conditions.push(`created_at <= $${paramIndex++}`);
       params.push(query.to);
+    }
+
+    if (query.userId) {
+      conditions.push(`user_id = $${paramIndex++}`);
+      params.push(query.userId);
+    }
+
+    if (query.metadata && Object.keys(query.metadata).length > 0) {
+      conditions.push(`metadata @> $${paramIndex++}::jsonb`);
+      params.push(safeStringify(query.metadata));
     }
 
     let sql = `SELECT * FROM ${workflowStatesTable}`;

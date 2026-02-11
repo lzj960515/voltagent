@@ -22,20 +22,19 @@ Create the agents that will serve as sub-agents:
 
 ```ts
 import { Agent } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 // Create an agent for content creation
 const contentCreatorAgent = new Agent({
   name: "ContentCreator",
   instructions: "Creates short text content on requested topics",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
 });
 
 // Create an agent for formatting
 const formatterAgent = new Agent({
   name: "Formatter",
   instructions: "Formats and styles text content",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
 });
 
 // Give sub-agents a concise purpose to control what the supervisor sees
@@ -44,7 +43,7 @@ const summarizerAgent = new Agent({
   purpose: "Summarize long support tickets",
   instructions:
     "Read the conversation and produce a concise summary highlighting blockers and owners",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
 });
 ```
 
@@ -54,12 +53,11 @@ Pass the agents in the `subAgents` array during supervisor initialization:
 
 ```ts
 import { Agent } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 const supervisorAgent = new Agent({
   name: "Supervisor",
   instructions: "Coordinates between content creation and formatting agents",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
   subAgents: [contentCreatorAgent, formatterAgent, summarizerAgent],
 });
 ```
@@ -92,12 +90,11 @@ The `supervisorConfig` option is only available when `subAgents` are provided. T
 
 ```ts
 import { Agent } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 const supervisorAgent = new Agent({
   name: "Content Supervisor",
   instructions: "Coordinate content creation workflow",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
   subAgents: [writerAgent, editorAgent],
 
   supervisorConfig: {
@@ -108,7 +105,7 @@ const supervisorAgent = new Agent({
       "Prioritize user experience",
     ],
 
-    // Control whether to include previous agent interactions
+    // Control whether prior sub-agent interactions are injected into supervisor prompt
     includeAgentsMemory: true, // default: true
   },
 });
@@ -122,7 +119,7 @@ Control which events from sub-agents are forwarded to the parent stream. By defa
 const supervisorAgent = new Agent({
   name: "Content Supervisor",
   instructions: "Coordinate content creation workflow",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
   subAgents: [writerAgent, editorAgent],
 
   supervisorConfig: {
@@ -169,7 +166,7 @@ Control how the supervisor handles sub-agent failures.
 const supervisorAgent = new Agent({
   name: "Supervisor",
   instructions: "Coordinate between agents",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
   subAgents: [dataProcessor, analyzer],
 
   supervisorConfig: {
@@ -213,8 +210,8 @@ const result = await supervisor.streamText("Process data");
 // result contains error message like "Error in DataProcessor: Stream failed"
 ```
 
-:::info Native Retry Support
-VoltAgent uses the AI SDK's native retry mechanism (default: 3 attempts). Setting `throwOnStreamError: true` is useful for custom error handling or logging at a higher level, not for implementing retry logic.
+:::info Retry Behavior
+VoltAgent retries model calls based on `maxRetries`. `throwOnStreamError` controls how stream errors are surfaced; it does not change retry or fallback behavior.
 :::
 
 **Silent Errors - Custom Messaging:**
@@ -370,7 +367,7 @@ Provide a custom `systemMessage` to replace the default template:
 const supervisorAgent = new Agent({
   name: "Custom Supervisor",
   instructions: "This will be ignored when systemMessage is provided",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
   subAgents: [writerAgent, editorAgent],
 
   supervisorConfig: {
@@ -419,8 +416,23 @@ supervisorConfig: {
 
 ```ts
 supervisorConfig: {
-  includeAgentsMemory: false; // Fresh context each interaction (default: true)
+  includeAgentsMemory: false; // Exclude prior sub-agent interactions from supervisor prompt (default: true)
 }
+```
+
+:::note `includeAgentsMemory` vs `memory: false`
+`includeAgentsMemory` only controls prompt construction for the supervisor. It does not disable conversation memory inside each sub-agent. If you need a stateless sub-agent, set `memory: false` on that sub-agent.
+:::
+
+**Stateless sub-agent:**
+
+```ts
+const writerAgent = new Agent({
+  name: "Writer",
+  instructions: "Write concise drafts.",
+  model: "openai/gpt-4o-mini",
+  memory: false,
+});
 ```
 
 **Configure event forwarding:**
@@ -498,26 +510,25 @@ This tool is automatically added to supervisor agents and handles delegation.
 
 ```ts
 import { Agent } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 
 // Create agents
 const writer = new Agent({
   name: "Writer",
   instructions: "Write creative stories",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
 });
 
 const translator = new Agent({
   name: "Translator",
   instructions: "Translate text accurately",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
 });
 
 // Create supervisor
 const supervisor = new Agent({
   name: "Supervisor",
   instructions: "Coordinate story writing and translation",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
   subAgents: [writer, translator],
 });
 

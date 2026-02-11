@@ -3,9 +3,10 @@ import type { DangerouslyAllowAny } from "@voltagent/internal/types";
 import type { StreamTextResult, UIMessage } from "ai";
 import type * as TF from "type-fest";
 import type { z } from "zod";
+import type { Agent } from "../agent/agent";
 import type { BaseMessage } from "../agent/providers";
 import type { UsageInfo } from "../agent/providers";
-import type { UserContext } from "../agent/types";
+import type { InputGuardrail, OutputGuardrail, UserContext } from "../agent/types";
 import type { Memory } from "../memory";
 import type { VoltAgentObservability } from "../observability";
 import type { WorkflowExecutionContext } from "./context";
@@ -30,6 +31,8 @@ export interface WorkflowSuspensionMetadata<SUSPEND_DATA = DangerouslyAllowAny> 
     stepExecutionState?: DangerouslyAllowAny;
     /** Results from completed steps that need to be preserved */
     completedStepsData?: DangerouslyAllowAny[];
+    /** Shared workflow state snapshot */
+    workflowState?: WorkflowStateStore;
   };
 }
 
@@ -199,6 +202,25 @@ export interface WorkflowStreamResult<
   abort: () => void;
 }
 
+export interface WorkflowRetryConfig {
+  /**
+   * Number of retry attempts for a step when it throws an error
+   * @default 0
+   */
+  attempts?: number;
+  /**
+   * Delay in milliseconds between retry attempts
+   * @default 0
+   */
+  delayMs?: number;
+}
+
+export type WorkflowStateStore = Record<string, unknown>;
+
+export type WorkflowStateUpdater =
+  | WorkflowStateStore
+  | ((previous: WorkflowStateStore) => WorkflowStateStore);
+
 export interface WorkflowRunOptions {
   /**
    * The active step, this can be used to track the current step in a workflow
@@ -222,6 +244,10 @@ export interface WorkflowRunOptions {
    * The user context, this can be used to track the current user context in a workflow
    */
   context?: UserContext;
+  /**
+   * Shared workflow state available to all steps
+   */
+  workflowState?: WorkflowStateStore;
   /**
    * Override Memory V2 for this specific execution
    * Takes priority over workflow config memory and global memory
@@ -247,6 +273,22 @@ export interface WorkflowRunOptions {
    * If not provided, will use the workflow's logger or global logger
    */
   logger?: Logger;
+  /**
+   * Override retry settings for this workflow execution
+   */
+  retryConfig?: WorkflowRetryConfig;
+  /**
+   * Input guardrails to run before workflow execution
+   */
+  inputGuardrails?: InputGuardrail[];
+  /**
+   * Output guardrails to run after workflow execution
+   */
+  outputGuardrails?: OutputGuardrail<any>[];
+  /**
+   * Optional agent instance to supply to workflow guardrails
+   */
+  guardrailAgent?: Agent;
 }
 
 export interface WorkflowResumeOptions {
@@ -260,6 +302,7 @@ export interface WorkflowResumeOptions {
   checkpoint?: {
     stepExecutionState?: DangerouslyAllowAny;
     completedStepsData?: DangerouslyAllowAny[];
+    workflowState?: WorkflowStateStore;
   };
   /**
    * The step index to resume from
@@ -280,6 +323,54 @@ export interface WorkflowResumeOptions {
  * @param DATA - The type of the data
  * @param RESULT - The type of the result
  */
+export type WorkflowHookStatus = "completed" | "suspended" | "cancelled" | "error";
+
+export type WorkflowStepStatus =
+  | "running"
+  | "success"
+  | "error"
+  | "suspended"
+  | "cancelled"
+  | "skipped";
+
+export type WorkflowStepData = {
+  input: DangerouslyAllowAny;
+  output?: DangerouslyAllowAny;
+  status: WorkflowStepStatus;
+  error?: Error | null;
+};
+
+export type WorkflowHookContext<DATA, RESULT> = {
+  /**
+   * Terminal status for the workflow execution
+   */
+  status: WorkflowHookStatus;
+  /**
+   * The current workflow state
+   */
+  state: WorkflowState<DATA, RESULT>;
+  /**
+   * Result of the workflow execution, if available
+   */
+  result: RESULT | null;
+  /**
+   * Error from the workflow execution, if any
+   */
+  error: unknown | null;
+  /**
+   * Suspension metadata when status is suspended
+   */
+  suspension?: WorkflowSuspensionMetadata;
+  /**
+   * Cancellation metadata when status is cancelled
+   */
+  cancellation?: WorkflowCancellationMetadata;
+  /**
+   * Step input/output snapshots keyed by step ID
+   */
+  steps: Record<string, WorkflowStepData>;
+};
+
 export type WorkflowHooks<DATA, RESULT> = {
   /**
    * Called when the workflow starts
@@ -300,11 +391,33 @@ export type WorkflowHooks<DATA, RESULT> = {
    */
   onStepEnd?: (state: WorkflowState<DATA, RESULT>) => Promise<void>;
   /**
-   * Called when the workflow ends
-   * @param state - The current state of the workflow
+   * Called when the workflow is suspended
+   * @param context - The terminal hook context
    * @returns void
    */
-  onEnd?: (state: WorkflowState<DATA, RESULT>) => Promise<void>;
+  onSuspend?: (context: WorkflowHookContext<DATA, RESULT>) => Promise<void>;
+  /**
+   * Called when the workflow ends with an error
+   * @param context - The terminal hook context
+   * @returns void
+   */
+  onError?: (context: WorkflowHookContext<DATA, RESULT>) => Promise<void>;
+  /**
+   * Called when the workflow reaches a terminal state
+   * @param context - The terminal hook context
+   * @returns void
+   */
+  onFinish?: (context: WorkflowHookContext<DATA, RESULT>) => Promise<void>;
+  /**
+   * Called when the workflow ends (completed, cancelled, or error)
+   * @param state - The current state of the workflow
+   * @param context - The terminal hook context
+   * @returns void
+   */
+  onEnd?: (
+    state: WorkflowState<DATA, RESULT>,
+    context?: WorkflowHookContext<DATA, RESULT>,
+  ) => Promise<void>;
 };
 
 export type WorkflowInput<INPUT_SCHEMA extends InternalBaseWorkflowInputSchema> =
@@ -371,6 +484,22 @@ export type WorkflowConfig<
    * If not provided, will use global observability or create a default one
    */
   observability?: VoltAgentObservability;
+  /**
+   * Input guardrails to run before workflow execution
+   */
+  inputGuardrails?: InputGuardrail[];
+  /**
+   * Output guardrails to run after workflow execution
+   */
+  outputGuardrails?: OutputGuardrail<any>[];
+  /**
+   * Optional agent instance to supply to workflow guardrails
+   */
+  guardrailAgent?: Agent;
+  /**
+   * Default retry configuration for steps in this workflow
+   */
+  retryConfig?: WorkflowRetryConfig;
 };
 
 /**
@@ -424,6 +553,22 @@ export type Workflow<
    */
   observability?: VoltAgentObservability;
   /**
+   * Input guardrails configured for this workflow
+   */
+  inputGuardrails?: InputGuardrail[];
+  /**
+   * Output guardrails configured for this workflow
+   */
+  outputGuardrails?: OutputGuardrail<any>[];
+  /**
+   * Optional agent instance supplied to workflow guardrails
+   */
+  guardrailAgent?: Agent;
+  /**
+   * Default retry configuration for steps in this workflow
+   */
+  retryConfig?: WorkflowRetryConfig;
+  /**
    * Get the full state of the workflow including all steps
    * @returns The serialized workflow state
    */
@@ -437,6 +582,11 @@ export type Workflow<
     resultSchema?: DangerouslyAllowAny;
     suspendSchema?: DangerouslyAllowAny;
     resumeSchema?: DangerouslyAllowAny;
+    retryConfig?: WorkflowRetryConfig;
+    guardrails?: {
+      inputCount: number;
+      outputCount: number;
+    };
   };
   /**
    * Execute the workflow with the given input
@@ -487,7 +637,21 @@ export interface BaseWorkflowHistoryEntry {
  */
 export interface BaseWorkflowStepHistoryEntry {
   stepIndex: number;
-  stepType: "agent" | "func" | "conditional-when" | "parallel-all" | "parallel-race";
+  stepType:
+    | "agent"
+    | "func"
+    | "conditional-when"
+    | "parallel-all"
+    | "parallel-race"
+    | "tap"
+    | "workflow"
+    | "guardrail"
+    | "sleep"
+    | "sleep-until"
+    | "foreach"
+    | "loop"
+    | "branch"
+    | "map";
   stepName: string;
   status: "pending" | "running" | "completed" | "error" | "skipped"; // includes all possible statuses
   startTime?: Date; // optional since pending steps might not have started
@@ -572,18 +736,21 @@ export interface WorkflowStats {
 /**
  * Event emitted during workflow streaming
  */
+export type WorkflowStreamEventType =
+  | "workflow-start"
+  | "workflow-suspended"
+  | "workflow-complete"
+  | "workflow-cancelled"
+  | "workflow-error"
+  | "step-start"
+  | "step-complete"
+  | (string & {});
+
 export interface WorkflowStreamEvent {
   /**
    * Type of the event (e.g., "step-start", "step-complete", "custom", "agent-stream")
    */
-  type:
-    | "workflow-start"
-    | "workflow-suspended"
-    | "workflow-complete"
-    | "workflow-cancelled"
-    | "workflow-error"
-    | "step-start"
-    | "step-complete";
+  type: WorkflowStreamEventType;
   /**
    * Unique execution ID for this workflow run
    */
@@ -603,7 +770,7 @@ export interface WorkflowStreamEvent {
   /**
    * Current status of the step/event
    */
-  status: "pending" | "running" | "success" | "error" | "suspended" | "cancelled";
+  status: "pending" | "running" | "success" | "skipped" | "error" | "suspended" | "cancelled";
   /**
    * User context passed through the workflow
    */
@@ -626,7 +793,14 @@ export interface WorkflowStreamEvent {
     | "parallel-all"
     | "parallel-race"
     | "tap"
-    | "workflow";
+    | "workflow"
+    | "guardrail"
+    | "sleep"
+    | "sleep-until"
+    | "foreach"
+    | "loop"
+    | "branch"
+    | "map";
   /**
    * Additional metadata
    */
@@ -644,7 +818,9 @@ export interface WorkflowStreamWriter {
   /**
    * Write a custom event to the stream
    */
-  write(event: Partial<WorkflowStreamEvent> & { type: string }): void;
+  write(
+    event: Omit<Partial<WorkflowStreamEvent>, "type"> & { type: WorkflowStreamEventType },
+  ): void;
 
   /**
    * Pipe events from an agent's fullStream to the workflow stream
@@ -694,6 +870,7 @@ export interface CreateWorkflowExecutionOptions {
   userId?: string;
   conversationId?: string;
   context?: UserContext;
+  workflowState?: WorkflowStateStore;
   metadata?: Record<string, unknown>;
   executionId?: string;
 }

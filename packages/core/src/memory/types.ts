@@ -6,7 +6,8 @@
 import type { UIMessage } from "ai";
 import type { z } from "zod";
 import type { MessageRole, UsageInfo } from "../agent/providers/base/types";
-import type { OperationContext } from "../agent/types";
+import type { AgentModelValue, OperationContext } from "../agent/types";
+import type { EmbeddingModelReference, EmbeddingOptions } from "./adapters/embedding/types";
 
 // ============================================================================
 // Core Types (Re-exported from existing memory system)
@@ -100,6 +101,20 @@ export interface GetConversationStepsOptions {
 // biome-ignore lint/complexity/noBannedTypes: <explanation>
 export type MemoryOptions = {};
 
+export type ConversationTitleConfig = {
+  enabled?: boolean;
+  model?: AgentModelValue;
+  maxOutputTokens?: number;
+  maxLength?: number;
+  systemPrompt?: string | null;
+};
+
+export type ConversationTitleGenerator = (params: {
+  input: OperationContext["input"] | UIMessage;
+  context: OperationContext;
+  defaultTitle: string;
+}) => Promise<string | null>;
+
 // ============================================================================
 // Workflow State Types
 // ============================================================================
@@ -121,6 +136,8 @@ export interface WorkflowStateEntry {
   input?: unknown;
   /** Execution context */
   context?: Array<[string | symbol, unknown]>;
+  /** Shared workflow state at the time of persistence */
+  workflowState?: Record<string, unknown>;
   /** Suspension metadata including checkpoint data */
   suspension?: {
     suspendedAt: Date;
@@ -130,6 +147,7 @@ export interface WorkflowStateEntry {
     checkpoint?: {
       stepExecutionState?: any;
       completedStepsData?: any[];
+      workflowState?: Record<string, unknown>;
     };
     suspendData?: any;
   };
@@ -175,6 +193,8 @@ export interface WorkflowRunQuery {
   to?: Date;
   limit?: number;
   offset?: number;
+  userId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 // ============================================================================
@@ -226,9 +246,9 @@ export interface MemoryConfig {
   storage: StorageAdapter;
 
   /**
-   * Optional embedding adapter for semantic operations
+   * Optional embedding adapter or model reference for semantic operations
    */
-  embedding?: EmbeddingAdapter;
+  embedding?: EmbeddingAdapterInput;
 
   /**
    * Optional vector adapter for similarity search
@@ -258,7 +278,29 @@ export interface MemoryConfig {
    * Enables agents to maintain important context
    */
   workingMemory?: WorkingMemoryConfig;
+
+  /**
+   * Automatically generate a title for new conversations using the agent's model
+   * (or the override model if provided).
+   * @default false
+   */
+  generateTitle?: boolean | ConversationTitleConfig;
 }
+
+/**
+ * Embedding adapter config for Memory
+ */
+export type EmbeddingAdapterConfig = EmbeddingOptions & {
+  model: EmbeddingModelReference;
+};
+
+/**
+ * Embedding input options for Memory
+ */
+export type EmbeddingAdapterInput =
+  | EmbeddingAdapter
+  | EmbeddingModelReference
+  | EmbeddingAdapterConfig;
 
 /**
  * Metadata about the underlying storage adapter
@@ -358,6 +400,17 @@ export interface StorageAdapter {
     context?: OperationContext,
   ): Promise<UIMessage<{ createdAt: Date }>[]>;
   clearMessages(userId: string, conversationId?: string, context?: OperationContext): Promise<void>;
+  /**
+   * Delete specific messages by ID for a conversation.
+   * Adapters should perform an atomic delete when possible. If atomic deletes or transactions
+   * are unavailable, a best-effort deletion (for example, clear + rehydrate) may be used.
+   */
+  deleteMessages(
+    messageIds: string[],
+    userId: string,
+    conversationId: string,
+    context?: OperationContext,
+  ): Promise<void>;
 
   // Conversation operations
   createConversation(input: CreateConversationInput): Promise<Conversation>;
@@ -368,6 +421,10 @@ export interface StorageAdapter {
     options?: Omit<ConversationQueryOptions, "userId">,
   ): Promise<Conversation[]>;
   queryConversations(options: ConversationQueryOptions): Promise<Conversation[]>;
+  /**
+   * Count conversations matching query filters (limit/offset ignored).
+   */
+  countConversations(options: ConversationQueryOptions): Promise<number>;
   updateConversation(
     id: string,
     updates: Partial<Omit<Conversation, "id" | "createdAt" | "updatedAt">>,

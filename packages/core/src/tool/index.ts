@@ -9,6 +9,38 @@ import { LoggerProxy } from "../logger";
  */
 type JSONValue = string | number | boolean | null | { [key: string]: JSONValue } | Array<JSONValue>;
 
+export type ToolExecutionResult<T> = PromiseLike<T> | AsyncIterable<T> | T;
+
+export interface ToolHookOnStartArgs {
+  tool: Tool<any, any>;
+  args: unknown;
+  options?: ToolExecuteOptions;
+}
+
+export interface ToolHookOnEndArgs {
+  tool: Tool<any, any>;
+  args: unknown;
+  /** The successful output from the tool. Undefined on error. */
+  output: unknown | undefined;
+  /** The error if the tool execution failed. */
+  error: unknown | undefined;
+  options?: ToolExecuteOptions;
+}
+
+export interface ToolHookOnEndResult {
+  output?: unknown;
+}
+
+export type ToolHookOnStart = (args: ToolHookOnStartArgs) => Promise<void> | void;
+export type ToolHookOnEnd = (
+  args: ToolHookOnEndArgs,
+) => Promise<ToolHookOnEndResult | undefined> | Promise<void> | ToolHookOnEndResult | undefined;
+
+export type ToolHooks = {
+  onStart?: ToolHookOnStart;
+  onEnd?: ToolHookOnEnd;
+};
+
 /**
  * Tool result output format for multi-modal content.
  * Matches AI SDK's LanguageModelV2ToolResultOutput type.
@@ -32,6 +64,19 @@ export type { ProviderOptions } from "@ai-sdk/provider-utils";
 export { ToolManager, ToolStatus, ToolStatusInfo } from "./manager";
 // Export Toolkit type and createToolkit function
 export { type Toolkit, createToolkit } from "./toolkit";
+// Export tool routing helpers
+export { createEmbeddingToolSearchStrategy } from "./routing";
+export type {
+  ToolSearchCandidate,
+  ToolSearchContext,
+  ToolSearchResult,
+  ToolSearchResultItem,
+  ToolSearchSelection,
+  ToolSearchStrategy,
+  ToolRoutingConfig,
+  ToolRoutingEmbeddingConfig,
+  ToolRoutingEmbeddingInput,
+} from "./routing/types";
 
 /**
  * Tool definition compatible with Vercel AI SDK
@@ -134,11 +179,17 @@ export type ToolOptions<
    * Function to execute when the tool is called.
    * @param args - The arguments passed to the tool
    * @param options - Optional execution options including context, abort signals, etc.
+   * @returns A result or an AsyncIterable of results (last value is final).
    */
   execute?: (
     args: z.infer<T>,
     options?: ToolExecuteOptions,
-  ) => Promise<O extends ToolSchema ? z.infer<O> : unknown>;
+  ) => ToolExecutionResult<O extends ToolSchema ? z.infer<O> : unknown>;
+
+  /**
+   * Optional tool-specific hooks for lifecycle events.
+   */
+  hooks?: ToolHooks;
 };
 
 /**
@@ -196,6 +247,11 @@ export class Tool<T extends ToolSchema = ToolSchema, O extends ToolSchema | unde
   }) => ToolResultOutput;
 
   /**
+   * Optional tool-specific hooks for lifecycle events.
+   */
+  readonly hooks?: ToolHooks;
+
+  /**
    * Internal discriminator to make runtime/type checks simpler across module boundaries.
    * Marking our Tool instances with a stable string avoids instanceof issues.
    */
@@ -205,11 +261,12 @@ export class Tool<T extends ToolSchema = ToolSchema, O extends ToolSchema | unde
    * Function to execute when the tool is called.
    * @param args - The arguments passed to the tool
    * @param options - Optional execution options including context, abort signals, etc.
+   * @returns A result or an AsyncIterable of results (last value is final).
    */
   readonly execute?: (
     args: z.infer<T>,
     options?: ToolExecuteOptions,
-  ) => Promise<O extends ToolSchema ? z.infer<O> : unknown>;
+  ) => ToolExecutionResult<O extends ToolSchema ? z.infer<O> : unknown>;
 
   /**
    * Whether this tool should be executed on the client side.
@@ -244,6 +301,7 @@ export class Tool<T extends ToolSchema = ToolSchema, O extends ToolSchema | unde
     this.providerOptions = options.providerOptions;
     this.toModelOutput = options.toModelOutput;
     this.execute = options.execute;
+    this.hooks = options.hooks;
   }
 }
 

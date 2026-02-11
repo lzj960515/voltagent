@@ -23,9 +23,12 @@
 .brandMark {
   width: 32px;
   height: 32px;
+  border-radius: 999px;
+  border: 2px solid #00d992;
   display: flex;
   align-items: center;
   justify-content: center;
+  background: rgba(0, 217, 146, 0.08);
   flex-shrink: 0;
 }
 
@@ -171,8 +174,8 @@
   transition: background 0.2s ease;
 }
 
-.tabActive { color: #f2f2f2; }
-.tabActive::after { background: #10b981; }
+.tab.tabActive { color: #f2f2f2; }
+.tab.tabActive::after { background: #10b981; }
 
 .mobileMenu {
   margin-top: 0.75rem;

@@ -14,6 +14,7 @@ import type {
   GetConversationStepsOptions,
   GetMessagesOptions,
   StorageAdapter,
+  WorkflowRunQuery,
   WorkflowStateEntry,
   WorkingMemoryScope,
 } from "@voltagent/core";
@@ -573,8 +574,12 @@ export class LibSQLMemoryCore implements StorageAdapter {
     const messagesTable = `${this.tablePrefix}_messages`;
     const { limit, before, after, roles } = options || {};
 
-    let sql = `SELECT * FROM ${messagesTable}
-               WHERE conversation_id = ? AND user_id = ?`;
+    let sql = `
+      SELECT * FROM (
+        SELECT *
+        FROM ${messagesTable}
+        WHERE conversation_id = ? AND user_id = ?
+    `;
     const args: any[] = [conversationId, userId];
 
     if (roles && roles.length > 0) {
@@ -593,11 +598,13 @@ export class LibSQLMemoryCore implements StorageAdapter {
       args.push(after.toISOString());
     }
 
-    sql += " ORDER BY created_at ASC";
+    sql += " ORDER BY created_at DESC";
     if (limit && limit > 0) {
       sql += " LIMIT ?";
       args.push(limit);
     }
+
+    sql += " ) AS subq ORDER BY created_at ASC";
 
     const result = await this.client.execute({ sql, args });
 
@@ -733,6 +740,26 @@ export class LibSQLMemoryCore implements StorageAdapter {
         args: [userId],
       });
     }
+  }
+
+  async deleteMessages(
+    messageIds: string[],
+    userId: string,
+    conversationId: string,
+  ): Promise<void> {
+    await this.initialize();
+
+    if (messageIds.length === 0) {
+      return;
+    }
+
+    const messagesTable = `${this.tablePrefix}_messages`;
+    const placeholders = messageIds.map(() => "?").join(",");
+    const sql = `DELETE FROM ${messagesTable} WHERE conversation_id = ? AND user_id = ? AND message_id IN (${placeholders})`;
+    await this.client.execute({
+      sql,
+      args: [conversationId, userId, ...messageIds],
+    });
   }
 
   // ============================================================================
@@ -874,6 +901,28 @@ export class LibSQLMemoryCore implements StorageAdapter {
       createdAt: row.created_at as string,
       updatedAt: row.updated_at as string,
     }));
+  }
+
+  async countConversations(options: ConversationQueryOptions): Promise<number> {
+    await this.initialize();
+
+    const conversationsTable = `${this.tablePrefix}_conversations`;
+    let sql = `SELECT COUNT(*) as count FROM ${conversationsTable} WHERE 1=1`;
+    const args: any[] = [];
+
+    if (options.userId) {
+      sql += " AND user_id = ?";
+      args.push(options.userId);
+    }
+
+    if (options.resourceId) {
+      sql += " AND resource_id = ?";
+      args.push(options.resourceId);
+    }
+
+    const result = await this.client.execute({ sql, args });
+    const count = Number(result.rows[0]?.count ?? 0);
+    return Number.isNaN(count) ? 0 : count;
   }
 
   async updateConversation(
@@ -1087,14 +1136,7 @@ export class LibSQLMemoryCore implements StorageAdapter {
     };
   }
 
-  async queryWorkflowRuns(query: {
-    workflowId?: string;
-    status?: WorkflowStateEntry["status"];
-    from?: Date;
-    to?: Date;
-    limit?: number;
-    offset?: number;
-  }): Promise<WorkflowStateEntry[]> {
+  async queryWorkflowRuns(query: WorkflowRunQuery): Promise<WorkflowStateEntry[]> {
     await this.initialize();
 
     const workflowStatesTable = `${this.tablePrefix}_workflow_states`;
@@ -1119,6 +1161,27 @@ export class LibSQLMemoryCore implements StorageAdapter {
     if (query.to) {
       conditions.push("created_at <= ?");
       args.push(query.to.toISOString());
+    }
+
+    if (query.userId) {
+      conditions.push("user_id = ?");
+      args.push(query.userId);
+    }
+
+    if (query.metadata && Object.keys(query.metadata).length > 0) {
+      for (const [key, value] of Object.entries(query.metadata)) {
+        const escapedKey = key.replace(/\\/g, "\\\\").replace(/"/g, '\\"');
+        const metadataPath = `$."${escapedKey}"`;
+        if (value === null) {
+          // Explicitly require key presence with null value
+          conditions.push("json_type(metadata, ?) = 'null'");
+          args.push(metadataPath);
+          continue;
+        }
+
+        conditions.push("json_extract(metadata, ?) = json(?)");
+        args.push(metadataPath, safeStringify(value));
+      }
     }
 
     let sql = `SELECT * FROM ${workflowStatesTable}`;

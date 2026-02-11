@@ -120,6 +120,70 @@ export type VoltOpsClientOptions = {
   };
 };
 
+export type VoltOpsFeedbackConfig = {
+  type: "continuous" | "categorical" | "freeform";
+  min?: number;
+  max?: number;
+  categories?: Array<{
+    value: string | number;
+    label?: string;
+    description?: string;
+  }>;
+  [key: string]: any;
+};
+
+export type VoltOpsFeedbackExpiresIn = {
+  days?: number;
+  hours?: number;
+  minutes?: number;
+};
+
+export type VoltOpsFeedbackToken = {
+  id: string;
+  url: string;
+  expiresAt: string;
+  feedbackConfig?: VoltOpsFeedbackConfig | null;
+};
+
+export type VoltOpsFeedbackTokenCreateInput = {
+  traceId: string;
+  key: string;
+  feedbackConfig?: VoltOpsFeedbackConfig | null;
+  expiresAt?: Date | string;
+  expiresIn?: VoltOpsFeedbackExpiresIn;
+};
+
+export type VoltOpsFeedbackCreateInput = {
+  traceId: string;
+  key: string;
+  id?: string;
+  score?: number | boolean | null;
+  value?: unknown;
+  correction?: unknown;
+  comment?: string | null;
+  feedbackConfig?: VoltOpsFeedbackConfig | null;
+  feedbackSource?: Record<string, unknown> | null;
+  feedbackSourceType?: string;
+  createdAt?: Date | string;
+};
+
+export type VoltOpsFeedback = {
+  id: string;
+  trace_id: string;
+  key: string;
+  score?: number | boolean | null;
+  value?: unknown;
+  correction?: unknown;
+  comment?: string | null;
+  feedback_source?: Record<string, unknown> | null;
+  feedback_source_type?: string | null;
+  feedback_config?: VoltOpsFeedbackConfig | null;
+  created_at?: string;
+  updated_at?: string;
+  source_info?: Record<string, unknown> | null;
+  [key: string]: unknown;
+};
+
 /**
  * Cached prompt data for performance optimization
  */
@@ -906,6 +970,12 @@ export interface VoltOpsClient {
   /** Evaluations API surface */
   evals: VoltOpsEvalsApi;
 
+  /** Create a feedback token for the given trace */
+  createFeedbackToken(input: VoltOpsFeedbackTokenCreateInput): Promise<VoltOpsFeedbackToken>;
+
+  /** Create a feedback entry for the given trace */
+  createFeedback(input: VoltOpsFeedbackCreateInput): Promise<VoltOpsFeedback>;
+
   /** Create a prompt helper for agent instructions */
   createPromptHelper(agentId: string, historyEntryId?: string): PromptHelper;
 
@@ -957,6 +1027,12 @@ export interface PromptContent {
     labels?: string[];
     /** Tags array for categorization */
     tags?: string[];
+    /** Prompt source location (e.g., "local-file" or "online") */
+    source?: "local-file" | "online";
+    /** Latest online version when available */
+    latest_version?: number;
+    /** Whether the local prompt is older than the online version */
+    outdated?: boolean;
     /** LLM configuration from prompt */
     config?: {
       model?: string;
@@ -1040,6 +1116,12 @@ export interface ManagedMemoryClearMessagesInput {
   conversationId?: string;
 }
 
+export interface ManagedMemoryDeleteMessagesInput {
+  conversationId: string;
+  userId: string;
+  messageIds: string[];
+}
+
 export interface ManagedMemoryGetConversationStepsInput {
   conversationId: string;
   userId: string;
@@ -1090,6 +1172,8 @@ export interface ManagedMemoryQueryWorkflowRunsInput {
   to?: Date;
   limit?: number;
   offset?: number;
+  userId?: string;
+  metadata?: Record<string, unknown>;
 }
 
 export interface ManagedMemoryWorkflowStateUpdateInput {
@@ -1102,6 +1186,7 @@ export interface ManagedMemoryMessagesClient {
   addBatch(databaseId: string, input: ManagedMemoryAddMessagesInput): Promise<void>;
   list(databaseId: string, input: ManagedMemoryGetMessagesInput): Promise<UIMessage[]>;
   clear(databaseId: string, input: ManagedMemoryClearMessagesInput): Promise<void>;
+  delete(databaseId: string, input: ManagedMemoryDeleteMessagesInput): Promise<void>;
 }
 
 export interface ManagedMemoryConversationsClient {

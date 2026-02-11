@@ -1,6 +1,6 @@
 ---
 title: Overview
-slug: /
+slug: /overview
 ---
 
 **VoltAgent** is an open source TypeScript framework for building and orchestrating AI agents.
@@ -19,6 +19,7 @@ VoltAgent provides a complete platform for developing and monitoring AI agents t
 
 For end-to-end walkthroughs (e.g., Slack agent), see the [Recipes & Guides](/recipes-and-guides/) section.
 Need a frontend? Check the [UI integration guides](/docs/ui/overview/) for ready-made chat UIs (AI SDK, CopilotKit, Assistant UI) backed by VoltAgent.
+Want docs access for AI assistants? See [Docs for AI Assistants](/docs/ai-assistants).
 
 ### Core Framework
 
@@ -65,6 +66,12 @@ description: 'Attach durable memory adapters so agents remember important contex
 },
 {
 type: 'link',
+href: '/docs/agents/resumable-streaming/',
+label: 'Resumable Streaming',
+description: 'Let clients reconnect to in-flight streams after refresh and continue the same response.'
+},
+{
+type: 'link',
 href: '/docs/rag/overview/',
 label: 'Retrieval & RAG',
 description: 'Plug in retriever agents to pull facts from your data sources and ground responses (RAG) before the model answers.'
@@ -100,13 +107,12 @@ description: 'Deploy your agents to production with one-click GitHub integration
 ```tsx
 import { VoltAgent, Agent } from "@voltagent/core";
 import { honoServer } from "@voltagent/server-hono";
-import { openai } from "@ai-sdk/openai";
 
 const agent = new Agent({
   name: "my-voltagent-app",
   instructions: "A helpful assistant that answers questions without using tools",
-  // VoltAgent uses the AI SDK directly - pick any ai-sdk model
-  model: openai("gpt-4o-mini"),
+  // VoltAgent uses the AI SDK directly - pass a LanguageModel or "provider/model"
+  model: "openai/gpt-4o-mini",
 });
 
 // Serve your agent over HTTP (default port 3141)
@@ -120,14 +126,13 @@ new VoltAgent({
 
 ```typescript
 import { createWorkflowChain, andThen, andAgent, Agent } from "@voltagent/core";
-import { openai } from "@ai-sdk/openai";
 import { z } from "zod";
 
 // First, define an agent to be used in the workflow
 const agent = new Agent({
   name: "summarizer-agent",
   instructions: "You are an expert at summarizing text.",
-  model: openai("gpt-4o-mini"),
+  model: "openai/gpt-4o-mini",
 });
 
 // Then, create the workflow that uses the agent
